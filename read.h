@@ -72,6 +72,14 @@
 /* Default maximum depth of nested aggregate replies. */
 #define REDIS_READER_MAX_REPLY_DEPTH 1024
 
+/* Default cumulative reply budgets. These limit the total scalar bytes and
+ * the total number of nodes accumulated across a whole top-level reply tree
+ * (as opposed to maxelements, which only limits a single aggregate). The
+ * budgets accumulate across redisReaderFeed() calls and are reset once a
+ * complete top-level reply has been delivered. 0 means unlimited. */
+#define REDIS_READER_MAX_REPLY_BYTES 0
+#define REDIS_READER_MAX_REPLY_NODES 0
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -115,6 +123,11 @@ typedef struct redisReader {
     void *privdata;
 
     int maxdepth; /* Max nested aggregate reply depth */
+
+    long long maxreplybytes; /* Max cumulative scalar bytes per top-level reply */
+    long long maxreplynodes; /* Max cumulative nodes per top-level reply */
+    long long replybytes; /* Scalar bytes accumulated for the current reply */
+    long long replynodes; /* Nodes accumulated for the current reply */
 } redisReader;
 
 /* Public API for the protocol parser. */

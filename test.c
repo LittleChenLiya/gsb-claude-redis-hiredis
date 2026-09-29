@@ -460,6 +460,26 @@ static void test_unix_keepalive(struct config cfg) {
     redisFree(c);
 }
 
+/* Deep-compare two reply trees; used to verify that a reply parsed from
+ * byte-wise feeds is identical to one parsed from a single block. */
+static int test_reply_equals(redisReply *a, redisReply *b) {
+    size_t i;
+
+    if (a == NULL || b == NULL)
+        return a == b;
+    if (a->type != b->type || a->elements != b->elements ||
+        a->integer != b->integer || a->len != b->len)
+        return 0;
+    if (a->len != 0 && memcmp(a->str,b->str,a->len) != 0)
+        return 0;
+    if (a->type == REDIS_REPLY_DOUBLE && a->dval != b->dval)
+        return 0;
+    for (i = 0; i < a->elements; i++)
+        if (!test_reply_equals(a->element[i],b->element[i]))
+            return 0;
+    return 1;
+}
+
 static void test_reply_reader(void) {
     redisReader *reader;
     void *reply, *root;
@@ -960,6 +980,267 @@ static void test_reply_reader(void) {
         fabs(((redisReply*)reply)->element[0]->dval - 3.14159265358979323846) < 0.00000001 &&
         ((redisReply*)reply)->element[0]->len == 22 &&
         strcmp(((redisReply*)reply)->element[0]->str, "3.14159265358979323846") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Reader defaults to unlimited cumulative reply budgets: ");
+    reader = redisReaderCreate();
+    test_cond(reader->maxreplybytes == REDIS_READER_MAX_REPLY_BYTES &&
+              reader->maxreplynodes == REDIS_READER_MAX_REPLY_NODES &&
+              reader->maxreplybytes == 0 && reader->maxreplynodes == 0 &&
+              reader->replybytes == 0 && reader->replynodes == 0);
+    redisReaderFree(reader);
+
+    test("Cumulative accounting matches for byte-wise and whole-block feeds: ");
+    {
+        /* 6 nodes, 14 scalar bytes: hello(5) 42(2) key(3) 3.14(4) */
+        const char *resp = "*3\r\n$5\r\nhello\r\n:42\r\n%1\r\n+key\r\n,3.14\r\n";
+        size_t resplen = strlen(resp), j;
+        redisReader *r1 = redisReaderCreate();
+        redisReader *r2 = redisReaderCreate();
+        void *reply1 = NULL, *reply2 = NULL;
+        int ok = 1;
+
+        r1->maxreplybytes = 1024;
+        r1->maxreplynodes = 1024;
+        r2->maxreplybytes = 1024;
+        r2->maxreplynodes = 1024;
+
+        /* Feed one reader a single byte at a time, the other in one block. */
+        for (j = 0; j < resplen; j++) {
+            if (redisReaderFeed(r1,resp+j,1) != REDIS_OK ||
+                redisReaderGetReply(r1,&reply1) != REDIS_OK)
+                ok = 0;
+        }
+        if (redisReaderFeed(r2,resp,resplen) != REDIS_OK ||
+            redisReaderGetReply(r2,&reply2) != REDIS_OK)
+            ok = 0;
+
+        if (reply1 == NULL || reply2 == NULL ||
+            !test_reply_equals(reply1,reply2) ||
+            r1->replybytes != r2->replybytes ||
+            r1->replynodes != r2->replynodes ||
+            r1->replybytes != 14 || r1->replynodes != 6)
+            ok = 0;
+
+        test_cond(ok);
+        freeReplyObject(reply1);
+        freeReplyObject(reply2);
+        redisReaderFree(r1);
+        redisReaderFree(r2);
+    }
+
+    test("Nested small arrays cannot bypass the cumulative node budget: ");
+    reader = redisReaderCreate();
+    reader->maxelements = 2;   /* every aggregate is within its own limit */
+    reader->maxreplynodes = 6; /* but the whole tree needs 7 nodes */
+    redisReaderFeed(reader,(char*)"*2\r\n*2\r\n:1\r\n:2\r\n*2\r\n:3\r\n:4\r\n",28);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Cumulative reply node budget exceeded") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Cumulative node budget is enforced at the exact node count: ");
+    {
+        /* 7 nodes total: root array, two nested arrays, four integers. */
+        const char *resp = "*2\r\n*2\r\n:1\r\n:2\r\n*2\r\n:3\r\n:4\r\n";
+        long long limit;
+        int ok = 1;
+
+        for (limit = 1; limit <= 8; limit++) {
+            reader = redisReaderCreate();
+            reader->maxreplynodes = limit;
+            redisReaderFeed(reader,(char*)resp,strlen(resp));
+            ret = redisReaderGetReply(reader,&reply);
+            if (limit >= 7) {
+                if (ret != REDIS_OK || reply == NULL) ok = 0;
+            } else {
+                if (ret != REDIS_ERR ||
+                    strcasecmp(reader->errstr,"Cumulative reply node budget exceeded") != 0)
+                    ok = 0;
+            }
+            freeReplyObject(reply);
+            reply = NULL;
+            redisReaderFree(reader);
+        }
+        test_cond(ok);
+    }
+
+    test("Cumulative byte budget is enforced at the exact byte count: ");
+    {
+        const char *resp = "$5\r\nhello\r\n";
+        long long limit;
+        int ok = 1;
+
+        for (limit = 4; limit <= 5; limit++) {
+            reader = redisReaderCreate();
+            reader->maxreplybytes = limit;
+            redisReaderFeed(reader,(char*)resp,strlen(resp));
+            ret = redisReaderGetReply(reader,&reply);
+            if (limit >= 5) {
+                if (ret != REDIS_OK || reply == NULL || reader->replybytes != 5)
+                    ok = 0;
+            } else {
+                if (ret != REDIS_ERR ||
+                    strcasecmp(reader->errstr,"Cumulative reply byte budget exceeded") != 0)
+                    ok = 0;
+            }
+            freeReplyObject(reply);
+            reply = NULL;
+            redisReaderFree(reader);
+        }
+        test_cond(ok);
+    }
+
+    test("Cumulative budgets account for nil nodes: ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader,(char*)"*3\r\n_\r\n$-1\r\n*-1\r\n",17);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply != NULL &&
+              reader->replynodes == 4 && reader->replybytes == 0 &&
+              ((redisReply*)reply)->type == REDIS_REPLY_ARRAY &&
+              ((redisReply*)reply)->element[0]->type == REDIS_REPLY_NIL &&
+              ((redisReply*)reply)->element[1]->type == REDIS_REPLY_NIL &&
+              ((redisReply*)reply)->element[2]->type == REDIS_REPLY_NIL);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Cumulative node budget also rejects a tree of nils: ");
+    reader = redisReaderCreate();
+    reader->maxreplynodes = 3;
+    redisReaderFeed(reader,(char*)"*3\r\n_\r\n$-1\r\n*-1\r\n",17);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Cumulative reply node budget exceeded") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Cumulative budgets account for maps (doubled elements): ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader,(char*)"%2\r\n+a\r\n:1\r\n+b\r\n:2\r\n",20);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply != NULL &&
+              ((redisReply*)reply)->type == REDIS_REPLY_MAP &&
+              reader->replynodes == 5 && reader->replybytes == 4);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Declared map length is rejected against the node budget: ");
+    reader = redisReaderCreate();
+    reader->maxelements = 0; /* Don't rely on the per-aggregate limit */
+    reader->maxreplynodes = 10;
+    redisReaderFeed(reader,(char*)"%100\r\n",6);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Cumulative reply node budget exceeded") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Cumulative budgets account for push replies: ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader,(char*)">2\r\n+msg\r\n+payload\r\n",20);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply != NULL &&
+              ((redisReply*)reply)->type == REDIS_REPLY_PUSH &&
+              reader->replynodes == 3 && reader->replybytes == 10);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Cumulative node budget is enforced on push replies: ");
+    reader = redisReaderCreate();
+    reader->maxreplynodes = 2;
+    redisReaderFeed(reader,(char*)">2\r\n+msg\r\n+payload\r\n",20);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Cumulative reply node budget exceeded") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("A partial bulk string is charged to the byte budget only once: ");
+    reader = redisReaderCreate();
+    reader->maxreplybytes = 5;
+    redisReaderFeed(reader,(char*)"$5\r\nhe",6);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply == NULL);
+    assert(reader->replybytes == 0); /* not complete yet, nothing charged */
+    redisReaderFeed(reader,(char*)"llo\r\n",5);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply != NULL &&
+              ((redisReply*)reply)->type == REDIS_REPLY_STRING &&
+              reader->replybytes == 5 && reader->replynodes == 1);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Declared bulk length is rejected early against the byte budget: ");
+    reader = redisReaderCreate();
+    reader->maxreplybytes = 4;
+    redisReaderFeed(reader,(char*)"$5\r\nhe",6); /* data not even complete */
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Cumulative reply byte budget exceeded") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Cumulative byte budget is enforced across nodes of one reply: ");
+    reader = redisReaderCreate();
+    reader->maxreplybytes = 4;
+    redisReaderFeed(reader,(char*)"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",22);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Cumulative reply byte budget exceeded") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Huge declared bulk length is rejected against the byte budget: ");
+    reader = redisReaderCreate();
+    reader->maxreplybytes = 1024;
+    redisReaderFeed(reader,(char*)"$9223372036854775807\r\n",22);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Cumulative reply byte budget exceeded") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Cumulative byte count cannot overflow on huge declared lengths: ");
+    reader = redisReaderCreate();
+    /* Unlimited budget: 5 bytes already accumulated, then a declared length
+     * of LLONG_MAX must be caught instead of overflowing the accumulator. */
+    redisReaderFeed(reader,(char*)"*2\r\n$5\r\nhello\r\n$9223372036854775807\r\n",37);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Cumulative reply byte count overflow") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Huge declared array length is rejected against the node budget: ");
+    reader = redisReaderCreate();
+    reader->maxelements = 0; /* Don't rely on the per-aggregate limit */
+    reader->maxreplynodes = 1024;
+    redisReaderFeed(reader,(char*)"*9223372036854775807\r\n",22);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr,"Cumulative reply node budget exceeded") == 0);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Cumulative budgets reset after a complete top-level reply: ");
+    reader = redisReaderCreate();
+    reader->maxreplybytes = 3;
+    reader->maxreplynodes = 1;
+    redisReaderFeed(reader,(char*)"$3\r\nfoo\r\n",9);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL &&
+           reader->replybytes == 3 && reader->replynodes == 1);
+    freeReplyObject(reply);
+    reply = NULL;
+    /* A second top-level reply must get a fresh budget, not accumulate. */
+    redisReaderFeed(reader,(char*)"$3\r\nbar\r\n",9);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply != NULL &&
+              reader->replybytes == 3 && reader->replynodes == 1 &&
+              ((redisReply*)reply)->type == REDIS_REPLY_STRING &&
+              !memcmp(((redisReply*)reply)->str,"bar",3));
     freeReplyObject(reply);
     redisReaderFree(reader);
 }

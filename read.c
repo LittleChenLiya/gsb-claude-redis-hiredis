@@ -132,6 +132,48 @@ static void __redisReaderSetErrorOOM(redisReader *r) {
     __redisReaderSetError(r,REDIS_ERR_OOM,"Out of memory");
 }
 
+/* Check that charging `len` more scalar bytes to the current top-level reply
+ * would neither overflow the accumulator nor exceed the cumulative byte
+ * budget. Does not modify the accumulator, so it can be used to reject an
+ * oversized declared length before its data has been received. */
+static int redisReaderCheckReplyBytes(redisReader *r, long long len) {
+    if (len > LLONG_MAX - r->replybytes) {
+        __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                "Cumulative reply byte count overflow");
+        return REDIS_ERR;
+    }
+    if (r->maxreplybytes > 0 && len > r->maxreplybytes - r->replybytes) {
+        __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                "Cumulative reply byte budget exceeded");
+        return REDIS_ERR;
+    }
+    return REDIS_OK;
+}
+
+/* Charge `len` scalar bytes to the cumulative byte budget of the current
+ * top-level reply. */
+static int redisReaderChargeReplyBytes(redisReader *r, long long len) {
+    if (redisReaderCheckReplyBytes(r,len) == REDIS_ERR)
+        return REDIS_ERR;
+    r->replybytes += len;
+    return REDIS_OK;
+}
+
+/* Charge one node to the cumulative node budget of the current top-level
+ * reply. Charged exactly once per node, when its type byte is read, so the
+ * count is stable no matter how the reply is split across feeds. */
+static int redisReaderChargeReplyNode(redisReader *r) {
+    if (r->replynodes == LLONG_MAX ||
+        (r->maxreplynodes > 0 && r->replynodes >= r->maxreplynodes))
+    {
+        __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                "Cumulative reply node budget exceeded");
+        return REDIS_ERR;
+    }
+    r->replynodes++;
+    return REDIS_OK;
+}
+
 static char *readBytes(redisReader *r, unsigned int bytes) {
     char *p;
     if (r->len-r->pos >= bytes) {
@@ -294,6 +336,9 @@ static int processLineItem(redisReader *r) {
     int len;
 
     if ((p = readLine(r,&len)) != NULL) {
+        if (redisReaderChargeReplyBytes(r,len) == REDIS_ERR)
+            return REDIS_ERR;
+
         if (cur->type == REDIS_REPLY_INTEGER) {
             long long v;
 
@@ -478,6 +523,11 @@ static int processBulkItem(redisReader *r) {
             return REDIS_ERR;
         }
 
+        /* Reject a declared length that would break the cumulative byte
+         * budget right away, before any of its data has been received. */
+        if (len > 0 && redisReaderCheckReplyBytes(r,len) == REDIS_ERR)
+            return REDIS_ERR;
+
         if (len == -1) {
             /* The nil object can always be created. */
             if (r->fn && r->fn->createNil)
@@ -511,6 +561,9 @@ static int processBulkItem(redisReader *r) {
                 __redisReaderSetErrorOOM(r);
                 return REDIS_ERR;
             }
+
+            if (redisReaderChargeReplyBytes(r,len > 0 ? len : 0) == REDIS_ERR)
+                return REDIS_ERR;
 
             r->pos += bytelen;
 
@@ -614,6 +667,17 @@ static int processAggregateItem(redisReader *r) {
                 elements *= 2;
             }
 
+            /* Reject early when the declared child count alone would exceed
+             * the remaining cumulative node budget, so that many small
+             * nested aggregates cannot sneak past the limit one by one. */
+            if (elements > 0 && r->maxreplynodes > 0 &&
+                elements > r->maxreplynodes - r->replynodes)
+            {
+                __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                        "Cumulative reply node budget exceeded");
+                return REDIS_ERR;
+            }
+
             if (r->fn && r->fn->createArray)
                 obj = r->fn->createArray(cur,elements);
             else
@@ -702,6 +766,10 @@ static int processItem(redisReader *r) {
                 __redisReaderSetErrorProtocolByte(r,*p);
                 return REDIS_ERR;
             }
+
+            /* A new node starts here; charge it exactly once. */
+            if (redisReaderChargeReplyNode(r) == REDIS_ERR)
+                return REDIS_ERR;
         } else {
             /* could not consume 1 byte */
             return REDIS_ERR;
@@ -758,6 +826,8 @@ redisReader *redisReaderCreateWithFunctions(redisReplyObjectFunctions *fn) {
     r->maxbuf = REDIS_READER_MAX_BUF;
     r->maxelements = REDIS_READER_MAX_ARRAY_ELEMENTS;
     r->maxdepth = REDIS_READER_MAX_REPLY_DEPTH;
+    r->maxreplybytes = REDIS_READER_MAX_REPLY_BYTES;
+    r->maxreplynodes = REDIS_READER_MAX_REPLY_NODES;
     r->ridx = -1;
 
     return r;
@@ -839,6 +909,11 @@ int redisReaderGetReply(redisReader *r, void **reply) {
         r->task[0]->parent = NULL;
         r->task[0]->privdata = r->privdata;
         r->ridx = 0;
+
+        /* The previous top-level reply was fully delivered, so a new one
+         * starts with a fresh cumulative budget. */
+        r->replybytes = 0;
+        r->replynodes = 0;
     }
 
     /* Process items in reply. */
