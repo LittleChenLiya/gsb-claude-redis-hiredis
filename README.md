@@ -648,6 +648,26 @@ meaning unlimited with:
 context->reader->maxdepth = 0;
 ```
 
+### Reader cumulative reply budget
+
+In addition to the per-aggregate element limit, the parser can optionally
+enforce a cumulative budget over an entire top-level reply tree:
+
+* `maxreplynodes` limits the total number of reply nodes (scalars and
+  aggregates alike), so many small nested aggregates cannot bypass
+  `maxelements`.
+* `maxreplybytes` limits the total number of scalar payload bytes (string
+  contents and scalar line payloads) in the reply tree.
+
+Both default to zero, meaning unlimited. The budget keeps accumulating across
+`redisReaderFeed()` chunks and is reset once a complete top-level reply has
+been delivered. The current accumulation is visible in the `replynodes` and
+`replybytes` fields of the reader. For example:
+```c
+context->reader->maxreplynodes = 100000;
+context->reader->maxreplybytes = 16 * 1024 * 1024;
+```
+
 ## SSL/TLS Support
 
 ### Building

@@ -132,6 +132,32 @@ static void __redisReaderSetErrorOOM(redisReader *r) {
     __redisReaderSetError(r,REDIS_ERR_OOM,"Out of memory");
 }
 
+/* Charge the optional cumulative reply budget for a single reply node
+ * carrying the given number of scalar payload bytes. The budget accumulates
+ * across redisReaderFeed() chunks for the duration of one top-level reply
+ * and is reset once that reply has been fully delivered, so many small
+ * nested aggregates cannot bypass the configured totals. All length
+ * arithmetic is overflow-checked. */
+static int __redisReaderChargeBudget(redisReader *r, unsigned long long bytes) {
+    if (r->replynodes == ULLONG_MAX || bytes > ULLONG_MAX - r->replybytes) {
+        __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                "Reply budget accounting overflow");
+        return REDIS_ERR;
+    }
+
+    r->replynodes++;
+    r->replybytes += bytes;
+
+    if ((r->maxreplynodes > 0 && r->replynodes > r->maxreplynodes) ||
+        (r->maxreplybytes > 0 && r->replybytes > r->maxreplybytes)) {
+        __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                "Cumulative reply budget exceeded");
+        return REDIS_ERR;
+    }
+
+    return REDIS_OK;
+}
+
 static char *readBytes(redisReader *r, unsigned int bytes) {
     char *p;
     if (r->len-r->pos >= bytes) {
@@ -443,6 +469,10 @@ static int processLineItem(redisReader *r) {
             return REDIS_ERR;
         }
 
+        /* Charge the line item's payload (len is 0 for nil) plus one node. */
+        if (__redisReaderChargeBudget(r, (unsigned long long)len) == REDIS_ERR)
+            return REDIS_ERR;
+
         /* Set reply if this is the root object. */
         if (r->ridx == 0) r->reply = obj;
         moveToNextTask(r);
@@ -457,7 +487,7 @@ static int processBulkItem(redisReader *r) {
     void *obj = NULL;
     char *p, *s;
     long long len;
-    unsigned long bytelen;
+    unsigned long long bytelen;
     int success = 0;
 
     p = r->buf+r->pos;
@@ -466,13 +496,20 @@ static int processBulkItem(redisReader *r) {
         p = r->buf+r->pos;
         bytelen = s-(r->buf+r->pos)+2; /* include \r\n */
 
-        if (string2ll(p, bytelen - 2, &len) == REDIS_ERR) {
+        if (string2ll(p, (size_t)(bytelen - 2), &len) == REDIS_ERR) {
             __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
                     "Bad bulk string length");
             return REDIS_ERR;
         }
 
         if (len < -1 || (LLONG_MAX > SIZE_MAX && len > (long long)SIZE_MAX)) {
+            __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                    "Bulk string length out of range");
+            return REDIS_ERR;
+        }
+
+        /* Guard the length arithmetic below against overflow. */
+        if (len > 0 && (unsigned long long)len > ULLONG_MAX - bytelen - 2) {
             __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
                     "Bulk string length out of range");
             return REDIS_ERR;
@@ -487,8 +524,8 @@ static int processBulkItem(redisReader *r) {
             success = 1;
         } else {
             /* Only continue when the buffer contains the entire bulk item. */
-            bytelen += len+2; /* include \r\n */
-            if (r->pos+bytelen <= r->len) {
+            bytelen += (unsigned long long)len+2; /* include \r\n */
+            if (bytelen <= r->len-r->pos) {
                 if ((cur->type == REDIS_REPLY_VERB && len < 4) ||
                     (cur->type == REDIS_REPLY_VERB && s[5] != ':'))
                 {
@@ -511,6 +548,10 @@ static int processBulkItem(redisReader *r) {
                 __redisReaderSetErrorOOM(r);
                 return REDIS_ERR;
             }
+
+            /* Charge the bulk payload (0 for nil) plus one node. */
+            if (__redisReaderChargeBudget(r, len > 0 ? (unsigned long long)len : 0) == REDIS_ERR)
+                return REDIS_ERR;
 
             r->pos += bytelen;
 
@@ -584,6 +625,11 @@ static int processAggregateItem(redisReader *r) {
                     "Multi-bulk length out of range");
             return REDIS_ERR;
         }
+
+        /* Charge one node for the aggregate itself so that many small
+         * nested aggregates cannot bypass the cumulative node budget. */
+        if (__redisReaderChargeBudget(r, 0) == REDIS_ERR)
+            return REDIS_ERR;
 
         if (elements == -1) {
             if (r->fn && r->fn->createNil)
@@ -758,6 +804,8 @@ redisReader *redisReaderCreateWithFunctions(redisReplyObjectFunctions *fn) {
     r->maxbuf = REDIS_READER_MAX_BUF;
     r->maxelements = REDIS_READER_MAX_ARRAY_ELEMENTS;
     r->maxdepth = REDIS_READER_MAX_REPLY_DEPTH;
+    r->maxreplybytes = REDIS_READER_MAX_REPLY_BYTES;
+    r->maxreplynodes = REDIS_READER_MAX_REPLY_NODES;
     r->ridx = -1;
 
     return r;
@@ -832,6 +880,11 @@ int redisReaderGetReply(redisReader *r, void **reply) {
 
     /* Set first item to process when the stack is empty. */
     if (r->ridx == -1) {
+        /* A complete top-level reply was delivered (or none was started);
+         * reset the cumulative reply budget for the next reply tree. */
+        r->replybytes = 0;
+        r->replynodes = 0;
+
         r->task[0]->type = -1;
         r->task[0]->elements = -1;
         r->task[0]->idx = -1;
