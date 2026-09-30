@@ -129,6 +129,13 @@ typedef struct redisReply {
                       terminated 3 character content type, such as "txt". */
     size_t elements; /* number of elements, for REDIS_REPLY_ARRAY */
     struct redisReply **element; /* elements vector for REDIS_REPLY_ARRAY */
+
+    /* RESP3 attribute attached to this reply (only populated for readers
+     * configured via redisReaderSetAttributeMode()). It is an ordered
+     * key/value collection laid out like a REDIS_REPLY_MAP element vector and
+     * is owned and freed together with this reply. */
+    size_t nattr;
+    struct redisReply **attr;
 } redisReply;
 
 redisReader *redisReaderCreate(void);

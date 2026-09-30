@@ -93,6 +93,14 @@ typedef struct redisReplyObjectFunctions {
     void *(*createNil)(const redisReadTask*);
     void *(*createBool)(const redisReadTask*, int);
     void (*freeObject)(void*);
+    /* Optional: used only by readers switched to attribute attachment mode
+     * via redisReaderSetAttributeMode(). attachAttribute associates an
+     * already parsed attribute object with the ordinary reply it preceded;
+     * mergeAttributes concatenates two consecutive attribute objects into
+     * one ordered key/value collection (duplicate keys preserved). A zero
+     * return (attach) or NULL return (merge) is reported as OOM. */
+    int (*attachAttribute)(void *reply, void *attr);
+    void *(*mergeAttributes)(void *prev, void *next);
 } redisReplyObjectFunctions;
 
 typedef struct redisReader {
@@ -111,6 +119,9 @@ typedef struct redisReader {
     int ridx; /* Index of current read task */
     void *reply; /* Temporary reply pointer */
 
+    int attributemode; /* Attach RESP3 attributes to the following reply */
+    void *attributes; /* Pending attributes waiting for a non-push reply */
+
     redisReplyObjectFunctions *fn;
     void *privdata;
 
@@ -122,6 +133,15 @@ redisReader *redisReaderCreateWithFunctions(redisReplyObjectFunctions *fn);
 void redisReaderFree(redisReader *r);
 int redisReaderFeed(redisReader *r, const char *buf, size_t len);
 int redisReaderGetReply(redisReader *r, void **reply);
+
+/* When enabled, RESP3 attribute frames are not returned as standalone
+ * replies: they are stashed and attached (through the reader's reply object
+ * function callbacks) to the next non-push reply. Consecutive attribute
+ * frames are merged into one ordered key/value collection, while push
+ * messages encountered in between are delivered on their own and leave the
+ * stashed attributes for the reply that follows. Returns REDIS_ERR when the
+ * reader's function set does not implement the attribute callbacks. */
+int redisReaderSetAttributeMode(redisReader *r, int enabled);
 
 #define redisReaderSetPrivdata(_r, _p) (int)(((redisReader*)(_r))->privdata = (_p))
 #define redisReaderGetObject(_r) (((redisReader*)(_r))->reply)

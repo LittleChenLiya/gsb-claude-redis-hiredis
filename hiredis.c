@@ -63,6 +63,8 @@ static void *createIntegerObject(const redisReadTask *task, long long value);
 static void *createDoubleObject(const redisReadTask *task, double value, char *str, size_t len);
 static void *createNilObject(const redisReadTask *task);
 static void *createBoolObject(const redisReadTask *task, int bval);
+static int attachReplyAttribute(void *reply, void *attr);
+static void *mergeReplyAttributes(void *prev, void *next);
 
 /* Default set of functions to build the reply. Keep in mind that such a
  * function returning NULL is interpreted as OOM. */
@@ -73,7 +75,9 @@ static redisReplyObjectFunctions defaultFunctions = {
     createDoubleObject,
     createNilObject,
     createBoolObject,
-    freeReplyObject
+    freeReplyObject,
+    attachReplyAttribute,
+    mergeReplyAttributes
 };
 
 /* Create a reply object */
@@ -94,6 +98,15 @@ void freeReplyObject(void *reply) {
 
     if (r == NULL)
         return;
+
+    /* An attached RESP3 attribute collection is never the reply itself.
+     * Attributes use the map layout: consecutive key/value pairs with
+     * duplicate keys preserved in order. */
+    if (r->type != REDIS_REPLY_ATTR && r->attr != NULL) {
+        for (j = 0; j < r->nattr; j++)
+            freeReplyObject(r->attr[j]);
+        hi_free(r->attr);
+    }
 
     switch(r->type) {
     case REDIS_REPLY_INTEGER:
@@ -299,6 +312,74 @@ static void *createBoolObject(const redisReadTask *task, int bval) {
         parent->element[task->idx] = r;
     }
     return r;
+}
+
+/* Attach a parsed RESP3 attribute (a REDIS_REPLY_ATTR reply built like a map)
+ * to the ordinary reply it preceded. Ownership of attr and its elements moves
+ * to reply. Returns 0 on allocation failure; in that case both arguments
+ * remain valid and are left untouched. */
+static int attachReplyAttribute(void *reply, void *attr) {
+    redisReply *target = reply;
+    redisReply *attributes = attr;
+    size_t count, j;
+    redisReply **merged;
+
+    assert(attributes != NULL && attributes->type == REDIS_REPLY_ATTR);
+    assert(target != NULL && target->type != REDIS_REPLY_ATTR);
+
+    count = target->nattr + attributes->elements;
+    if (count < target->nattr || count < attributes->elements)
+        return 0; /* size_t overflow */
+
+    if (count > 0) {
+        merged = hi_realloc(target->attr, sizeof(redisReply*) * count);
+        if (merged == NULL)
+            return 0;
+
+        target->attr = merged;
+        for (j = 0; j < attributes->elements; j++)
+            target->attr[target->nattr + j] = attributes->element[j];
+        target->nattr = count;
+    }
+
+    /* The element vector was transferred; only the attribute shell remains. */
+    hi_free(attributes->element);
+    hi_free(attributes);
+    return 1;
+}
+
+/* Concatenate two consecutive RESP3 attribute frames into one ordered
+ * key/value collection so duplicate keys survive instead of overwriting each
+ * other. On success both input shells are consumed and the merged reply is
+ * returned; on allocation failure NULL is returned and both inputs stay
+ * valid. */
+static void *mergeReplyAttributes(void *prev, void *next) {
+    redisReply *first = prev;
+    redisReply *second = next;
+    size_t count, j;
+    redisReply **merged;
+
+    assert(first != NULL && first->type == REDIS_REPLY_ATTR);
+    assert(second != NULL && second->type == REDIS_REPLY_ATTR);
+
+    count = first->elements + second->elements;
+    if (count < first->elements)
+        return NULL; /* size_t overflow */
+
+    if (count > 0) {
+        merged = hi_realloc(first->element, sizeof(redisReply*) * count);
+        if (merged == NULL)
+            return NULL;
+
+        first->element = merged;
+        for (j = 0; j < second->elements; j++)
+            first->element[first->elements + j] = second->element[j];
+        first->elements = count;
+    }
+
+    hi_free(second->element);
+    hi_free(second);
+    return first;
 }
 
 /* Return the number of digits of 'v' when converted to string in radix 10.

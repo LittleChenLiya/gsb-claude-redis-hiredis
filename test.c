@@ -964,6 +964,272 @@ static void test_reply_reader(void) {
     redisReaderFree(reader);
 }
 
+/* Allocator accounting for the RESP3 attribute mode tests. */
+static long test_attr_mallocs;
+static long test_attr_frees;
+static long test_attr_fail_at; /* all-time malloc/realloc call index to fail; 0 = off */
+static long test_attr_calls;
+
+static void *test_attr_malloc_fn(size_t size) {
+    long call = ++test_attr_calls;
+    if (test_attr_fail_at > 0 && call == test_attr_fail_at)
+        return NULL;
+    test_attr_mallocs++;
+    return malloc(size);
+}
+
+static void *test_attr_calloc_fn(size_t nmemb, size_t size) {
+    long call = ++test_attr_calls;
+    void *p;
+    if (test_attr_fail_at > 0 && call == test_attr_fail_at)
+        return NULL;
+    p = calloc(nmemb,size);
+    if (p != NULL)
+        test_attr_mallocs++;
+    return p;
+}
+
+static void *test_attr_realloc_fn(void *ptr, size_t size) {
+    long call = ++test_attr_calls;
+    void *p;
+    if (test_attr_fail_at > 0 && call == test_attr_fail_at)
+        return NULL;
+    p = realloc(ptr,size);
+    if (p != NULL && ptr == NULL)
+        test_attr_mallocs++;
+    return p;
+}
+
+static void test_attr_free_fn(void *ptr) {
+    if (ptr != NULL)
+        test_attr_frees++;
+    free(ptr);
+}
+
+/* Feed the whole stream one byte at a time and collect complete replies. */
+static void feedByteByByte(redisReader *reader, const char *buf, size_t len,
+                           void **out, int *nout, int maxout) {
+    size_t i;
+    void *reply = NULL;
+    int ret;
+
+    for (i = 0; i < len; i++) {
+        ret = redisReaderFeed(reader, buf + i, 1);
+        assert(ret == REDIS_OK);
+        reply = NULL;
+        ret = redisReaderGetReply(reader, &reply);
+        assert(ret == REDIS_OK);
+        if (reply != NULL) {
+            assert(*nout < maxout);
+            out[(*nout)++] = reply;
+        }
+    }
+}
+
+static void test_reply_reader_attribute_mode(void) {
+    hiredisAllocFuncs ha = {
+        .mallocFn = test_attr_malloc_fn,
+        .callocFn = test_attr_calloc_fn,
+        .reallocFn = test_attr_realloc_fn,
+        .strdupFn = strdup,
+        .freeFn = test_attr_free_fn,
+    };
+    hiredisAllocFuncs orig;
+    redisReader *reader;
+    void *reply;
+    void *replies[8];
+    int nreplies, ret;
+    const char *stream;
+    redisReply *attr;
+    size_t i;
+
+    orig = hiredisSetAllocators(&ha);
+
+    /* One stream with two consecutive attribute frames (a duplicate key),
+     * an interleaved push and two ordinary replies. Everything is fed byte
+     * by byte to make sure partial frames never attach to the wrong reply. */
+    test("RESP3 attributes attach across pushes with byte-wise feed: ");
+    test_attr_mallocs = test_attr_frees = test_attr_calls = 0;
+    test_attr_fail_at = 0;
+    nreplies = 0;
+    reader = redisReaderCreate();
+    assert(reader != NULL);
+    ret = redisReaderSetAttributeMode(reader,1);
+    assert(ret == REDIS_OK);
+
+    stream = "|1\r\n+foo\r\n:1\r\n"              /* attr: foo -> 1 */
+             "|1\r\n+foo\r\n:2\r\n"              /* attr: foo -> 2 (dup key) */
+             ">2\r\n+pub\r\n+msg\r\n"          /* push interrupts */
+             ":42\r\n"                          /* attrs land here */
+             "|1\r\n+bar\r\n#t\r\n"            /* fresh attr */
+             "$3\r\nhey\r\n";                  /* attr lands here */
+    feedByteByByte(reader, stream, strlen(stream), replies, &nreplies, 8);
+
+    { int ok = nreplies == 3 &&
+        ((redisReply*)replies[0])->type == REDIS_REPLY_PUSH &&
+        ((redisReply*)replies[0])->nattr == 0 &&
+        ((redisReply*)replies[1])->type == REDIS_REPLY_INTEGER &&
+        ((redisReply*)replies[1])->integer == 42 &&
+        ((redisReply*)replies[1])->nattr == 4 &&
+        ((redisReply*)replies[1])->attr[0]->type == REDIS_REPLY_STATUS &&
+        !strcmp(((redisReply*)replies[1])->attr[0]->str,"foo") &&
+        ((redisReply*)replies[1])->attr[1]->type == REDIS_REPLY_INTEGER &&
+        ((redisReply*)replies[1])->attr[1]->integer == 1 &&
+        ((redisReply*)replies[1])->attr[2]->type == REDIS_REPLY_STATUS &&
+        !strcmp(((redisReply*)replies[1])->attr[2]->str,"foo") &&
+        ((redisReply*)replies[1])->attr[3]->type == REDIS_REPLY_INTEGER &&
+        ((redisReply*)replies[1])->attr[3]->integer == 2 &&
+        ((redisReply*)replies[2])->type == REDIS_REPLY_STRING &&
+        ((redisReply*)replies[2])->len == 3 &&
+        !strcmp(((redisReply*)replies[2])->str,"hey") &&
+        ((redisReply*)replies[2])->nattr == 2 &&
+        ((redisReply*)replies[2])->attr[0]->type == REDIS_REPLY_STATUS &&
+        !strcmp(((redisReply*)replies[2])->attr[0]->str,"bar") &&
+        ((redisReply*)replies[2])->attr[1]->type == REDIS_REPLY_BOOL &&
+        ((redisReply*)replies[2])->attr[1]->integer == 1;
+
+    for (i = 0; i < (size_t)nreplies; i++)
+        freeReplyObject(replies[i]);
+    redisReaderFree(reader);
+    test_cond(ok && test_attr_mallocs == test_attr_frees); }
+
+    /* Truncated trailing attribute with no following reply stays stashed and
+     * must be released when the reader is freed. */
+    test("RESP3 truncated attribute with no reply is freed: ");
+    test_attr_mallocs = test_attr_frees = test_attr_calls = 0;
+    test_attr_fail_at = 0;
+    nreplies = 0;
+    reader = redisReaderCreate();
+    redisReaderSetAttributeMode(reader,1);
+    stream = "|2\r\n+k1\r\n:10\r\n+k2\r\n:20\r\n";
+    feedByteByByte(reader, stream, strlen(stream), replies, &nreplies, 8);
+    ret = redisReaderGetReply(reader,&reply);
+    redisReaderFree(reader);
+    test_cond(ret == REDIS_OK && reply == NULL && nreplies == 0 &&
+              test_attr_mallocs == test_attr_frees);
+
+    /* A stashed attribute survives truncation and attaches once the rest of
+     * the ordinary reply trickles in. */
+    test("RESP3 attribute attaches after interrupted feed: ");
+    test_attr_mallocs = test_attr_frees = test_attr_calls = 0;
+    test_attr_fail_at = 0;
+    reader = redisReaderCreate();
+    redisReaderSetAttributeMode(reader,1);
+    stream = "|1\r\n+k\r\n+v\r\n+";
+    redisReaderFeed(reader,stream,strlen(stream));
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply == NULL);
+    redisReaderFeed(reader,"ok\r\n",4);
+    ret = redisReaderGetReply(reader,&reply);
+    attr = reply ? ((redisReply*)reply)->attr[0] : NULL;
+    { int ok = ret == REDIS_OK && reply != NULL &&
+        ((redisReply*)reply)->type == REDIS_REPLY_STATUS &&
+        !strcmp(((redisReply*)reply)->str,"ok") &&
+        ((redisReply*)reply)->nattr == 2 &&
+        attr != NULL && attr->type == REDIS_REPLY_STATUS &&
+        !strcmp(attr->str,"k");
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+    test_cond(ok && test_attr_mallocs == test_attr_frees); }
+
+    /* Nested values inside the attribute are preserved on the reply. */
+    test("RESP3 attribute keeps nested values: ");
+    test_attr_mallocs = test_attr_frees = test_attr_calls = 0;
+    test_attr_fail_at = 0;
+    reader = redisReaderCreate();
+    redisReaderSetAttributeMode(reader,1);
+    stream = "|1\r\n+meta\r\n%1\r\n+a\r\n*2\r\n:1\r\n:2\r\n_\r\n";
+    feedByteByByte(reader, stream, strlen(stream), replies, &nreplies, 8);
+    { int ok = nreplies == 1 &&
+        ((redisReply*)replies[0])->type == REDIS_REPLY_NIL &&
+        ((redisReply*)replies[0])->nattr == 2 &&
+        ((redisReply*)replies[0])->attr[1]->type == REDIS_REPLY_MAP &&
+        ((redisReply*)replies[0])->attr[1]->elements == 2 &&
+        ((redisReply*)replies[0])->attr[1]->element[1]->type == REDIS_REPLY_ARRAY &&
+        ((redisReply*)replies[0])->attr[1]->element[1]->elements == 2 &&
+        ((redisReply*)replies[0])->attr[1]->element[1]->element[1]->integer == 2;
+    freeReplyObject(replies[0]);
+    redisReaderFree(reader);
+    test_cond(ok && test_attr_mallocs == test_attr_frees); }
+
+    /* Attribute element counts are bounded by maxelements, even when an
+     * earlier attribute is already stashed. */
+    test("RESP3 oversized attribute errors and frees stashed data: ");
+    test_attr_mallocs = test_attr_frees = test_attr_calls = 0;
+    test_attr_fail_at = 0;
+    reader = redisReaderCreate();
+    reader->maxelements = 1;
+    redisReaderSetAttributeMode(reader,1);
+    stream = "|1\r\n+foo\r\n:1\r\n|2\r\n";
+    redisReaderFeed(reader,stream,strlen(stream));
+    ret = redisReaderGetReply(reader,&reply);
+    { int ok = ret == REDIS_ERR &&
+               reader->err == REDIS_ERR_PROTOCOL &&
+               strcasecmp(reader->errstr,"Multi-bulk length out of range") == 0;
+    redisReaderFree(reader);
+    test_cond(ok && test_attr_mallocs == test_attr_frees); }
+
+    /* OOM while merging two consecutive attributes: the reader reports OOM
+     * and everything allocated up to the failure is released. */
+    test("RESP3 attribute merge OOM is cleaned up: ");
+    test_attr_mallocs = test_attr_frees = test_attr_calls = 0;
+    test_attr_fail_at = 0;
+    reader = redisReaderCreate();
+    redisReaderSetAttributeMode(reader,1);
+    stream = "|1\r\n+a\r\n:1\r\n|1\r\n+b\r\n:2\r\n:9\r\n";
+    redisReaderFeed(reader,stream,strlen(stream));
+    test_attr_fail_at = test_attr_calls + 1; /* fail the merge realloc */
+    ret = redisReaderGetReply(reader,&reply);
+    { int ok = ret == REDIS_ERR && reader->err == REDIS_ERR_OOM;
+    test_attr_fail_at = 0;
+    redisReaderFree(reader);
+    test_cond(ok && test_attr_mallocs == test_attr_frees); }
+
+    /* Mode must be opted in: without it the attribute is still delivered as
+     * a standalone REDIS_REPLY_ATTR reply. */
+    test("RESP3 attribute stays standalone without the mode: ");
+    test_attr_mallocs = test_attr_frees = test_attr_calls = 0;
+    test_attr_fail_at = 0;
+    reader = redisReaderCreate();
+    nreplies = 0;
+    stream = "|1\r\n+foo\r\n:1\r\n:42\r\n";
+    feedByteByByte(reader, stream, strlen(stream), replies, &nreplies, 8);
+    { int ok = nreplies == 2 &&
+        ((redisReply*)replies[0])->type == REDIS_REPLY_ATTR &&
+        ((redisReply*)replies[0])->elements == 2 &&
+        ((redisReply*)replies[1])->type == REDIS_REPLY_INTEGER &&
+        ((redisReply*)replies[1])->nattr == 0;
+    freeReplyObject(replies[0]);
+    freeReplyObject(replies[1]);
+    redisReaderFree(reader);
+    test_cond(ok && test_attr_mallocs == test_attr_frees); }
+
+    /* Discarding an interleaved push via a NULL reply pointer must not drop
+     * the attributes stashed for the upcoming ordinary reply. */
+    test("RESP3 attributes survive discarded push replies: ");
+    test_attr_mallocs = test_attr_frees = test_attr_calls = 0;
+    test_attr_fail_at = 0;
+    reader = redisReaderCreate();
+    redisReaderSetAttributeMode(reader,1);
+    stream = "|1\r\n+k\r\n:7\r\n>1\r\n+x\r\n";
+    redisReaderFeed(reader,stream,strlen(stream));
+    ret = redisReaderGetReply(reader,NULL); /* parses attr + push, drops push */
+    assert(ret == REDIS_OK);
+    stream = "+done\r\n";
+    redisReaderFeed(reader,stream,strlen(stream));
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply != NULL &&
+        ((redisReply*)reply)->type == REDIS_REPLY_STATUS &&
+        !strcmp(((redisReply*)reply)->str,"done") &&
+        ((redisReply*)reply)->nattr == 2 &&
+        ((redisReply*)reply)->attr[1]->integer == 7);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+    test_cond(test_attr_mallocs == test_attr_frees);
+
+    hiredisSetAllocators(&orig);
+}
+
 static void test_free_null(void) {
     void *redisCtx = NULL;
     void *reply = NULL;
@@ -2745,6 +3011,7 @@ int main(int argc, char **argv) {
 
     test_format_commands();
     test_reply_reader();
+    test_reply_reader_attribute_mode();
     test_blocking_connection_errors();
     test_free_null();
 #ifdef __linux__

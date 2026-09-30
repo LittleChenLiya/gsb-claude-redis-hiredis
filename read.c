@@ -74,6 +74,13 @@
 static void __redisReaderSetError(redisReader *r, int type, const char *str) {
     size_t len;
 
+    /* An attribute collection stashed for a future reply is never part of
+     * the half-parsed r->reply object, so release it explicitly. */
+    if (r->attributes != NULL && r->fn && r->fn->freeObject) {
+        r->fn->freeObject(r->attributes);
+        r->attributes = NULL;
+    }
+
     if (r->reply != NULL && r->fn && r->fn->freeObject) {
         r->fn->freeObject(r->reply);
         r->reply = NULL;
@@ -770,6 +777,9 @@ void redisReaderFree(redisReader *r) {
     if (r == NULL)
         return;
 
+    if (r->attributes != NULL && r->fn && r->fn->freeObject)
+        r->fn->freeObject(r->attributes);
+
     if (r->reply != NULL && r->fn && r->fn->freeObject)
         r->fn->freeObject(r->reply);
 
@@ -817,14 +827,13 @@ oom:
     return REDIS_ERR;
 }
 
-int redisReaderGetReply(redisReader *r, void **reply) {
-    /* Default target pointer to NULL. */
-    if (reply != NULL)
-        *reply = NULL;
-
-    /* Return early when this reader is in an erroneous state. */
-    if (r->err)
-        return REDIS_ERR;
+/* Complete one top-level item from the input buffer. On success returns
+ * REDIS_OK and sets *obj to the parsed object (which may be NULL when the
+ * item was only partially available); *type receives its reply type. The
+ * caller owns *obj once it is no longer referenced by the reader. */
+static int redisReaderReadOneObject(redisReader *r, int *type, void **obj) {
+    *type = -1;
+    *obj = NULL;
 
     /* When the buffer is empty, there will never be a reply. */
     if (r->len == 0)
@@ -850,6 +859,102 @@ int redisReaderGetReply(redisReader *r, void **reply) {
     if (r->err)
         return REDIS_ERR;
 
+    /* Emit the completed top-level object. */
+    if (r->ridx == -1) {
+        *type = r->task[0]->type;
+        *obj = r->reply;
+        r->reply = NULL;
+    }
+    return REDIS_OK;
+}
+
+int redisReaderSetAttributeMode(redisReader *r, int enabled) {
+    if (r->err)
+        return REDIS_ERR;
+
+    if (enabled) {
+        if (r->fn == NULL ||
+            r->fn->attachAttribute == NULL ||
+            r->fn->mergeAttributes == NULL ||
+            r->fn->freeObject == NULL)
+        {
+            __redisReaderSetError(r,REDIS_ERR_OTHER,
+                "Attribute mode requires attachAttribute, mergeAttributes "
+                "and freeObject reply functions");
+            return REDIS_ERR;
+        }
+    }
+
+    r->attributemode = enabled ? 1 : 0;
+    return REDIS_OK;
+}
+
+int redisReaderGetReply(redisReader *r, void **reply) {
+    int type;
+    void *obj = NULL;
+
+    /* Default target pointer to NULL. */
+    if (reply != NULL)
+        *reply = NULL;
+
+    /* Return early when this reader is in an erroneous state. */
+    if (r->err)
+        return REDIS_ERR;
+
+    /* In attribute mode, keep parsing top-level items: stash attribute
+     * frames (merging consecutive ones), deliver push messages as their own
+     * replies and attach everything stashed to the first non-push reply. A
+     * single call still hands back at most one reply; incomplete trailing
+     * data leaves stashed attributes pending for a future call. */
+    for (;;) {
+        if (redisReaderReadOneObject(r,&type,&obj) != REDIS_OK)
+            return REDIS_ERR;
+
+        if (obj == NULL)
+            break; /* Incomplete item; more data needed. */
+
+        if (r->attributemode && type == REDIS_REPLY_ATTR) {
+            if (r->attributes != NULL) {
+                void *merged;
+
+                merged = r->fn->mergeAttributes(r->attributes,obj);
+                if (merged == NULL) {
+                    r->fn->freeObject(obj);
+                    __redisReaderSetErrorOOM(r);
+                    return REDIS_ERR;
+                }
+                r->attributes = merged;
+            } else {
+                r->attributes = obj;
+            }
+            obj = NULL;
+
+            /* No more input could have produced another item. */
+            if (r->pos >= r->len)
+                break;
+            continue;
+        }
+
+        if (r->attributemode && type != REDIS_REPLY_PUSH &&
+            r->attributes != NULL)
+        {
+            if (!r->fn->attachAttribute(obj,r->attributes)) {
+                r->fn->freeObject(obj);
+                __redisReaderSetErrorOOM(r);
+                return REDIS_ERR;
+            }
+            r->attributes = NULL;
+        }
+
+        if (reply != NULL) {
+            *reply = obj;
+        } else {
+            if (r->fn && r->fn->freeObject)
+                r->fn->freeObject(obj);
+        }
+        break;
+    }
+
     /* Discard part of the buffer when we've consumed at least 1k, to avoid
      * doing unnecessary calls to memmove() in sds.c. */
     if (r->pos >= 1024) {
@@ -858,14 +963,5 @@ int redisReaderGetReply(redisReader *r, void **reply) {
         r->len = sdslen(r->buf);
     }
 
-    /* Emit a reply when there is one. */
-    if (r->ridx == -1) {
-        if (reply != NULL) {
-            *reply = r->reply;
-        } else if (r->reply != NULL && r->fn && r->fn->freeObject) {
-            r->fn->freeObject(r->reply);
-        }
-        r->reply = NULL;
-    }
     return REDIS_OK;
 }
