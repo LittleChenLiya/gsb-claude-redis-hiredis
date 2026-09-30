@@ -93,6 +93,15 @@ typedef struct redisReplyObjectFunctions {
     void *(*createNil)(const redisReadTask*);
     void *(*createBool)(const redisReadTask*, int);
     void (*freeObject)(void*);
+    /* Optional hooks used by the reader's attribute attach mode (see
+     * redisReaderSetAttachAttrs).  mergeAttr must absorb the attribute reply
+     * 'src' into the pending attribute reply 'dst' (preserving order and
+     * duplicate keys) and return the merged reply, or NULL on failure leaving
+     * both intact.  attachAttr attaches the pending attribute reply 'attr'
+     * to the reply 'reply'.  When either hook is NULL the attach mode is
+     * disabled and attribute replies are delivered like any other reply. */
+    void *(*mergeAttr)(void *dst, void *src);
+    void (*attachAttr)(void *reply, void *attr);
 } redisReplyObjectFunctions;
 
 typedef struct redisReader {
@@ -110,11 +119,13 @@ typedef struct redisReader {
 
     int ridx; /* Index of current read task */
     void *reply; /* Temporary reply pointer */
+    void *attr; /* Stashed RESP3 attributes awaiting their reply */
 
     redisReplyObjectFunctions *fn;
     void *privdata;
 
     int maxdepth; /* Max nested aggregate reply depth */
+    int attachattrs; /* Attach RESP3 attributes to the following reply */
 } redisReader;
 
 /* Public API for the protocol parser. */
@@ -122,6 +133,14 @@ redisReader *redisReaderCreateWithFunctions(redisReplyObjectFunctions *fn);
 void redisReaderFree(redisReader *r);
 int redisReaderFeed(redisReader *r, const char *buf, size_t len);
 int redisReaderGetReply(redisReader *r, void **reply);
+
+/* Enable or disable attribute attach mode.  When enabled, top-level RESP3
+ * attribute replies are not delivered on their own: consecutive attribute
+ * blocks are merged into a single ordered key/value list (duplicate keys are
+ * preserved) which is attached to the next non-push reply.  Push messages
+ * interleaved with attributes are still delivered on their own, and any
+ * stashed attributes remain pending for the next non-push reply. */
+void redisReaderSetAttachAttrs(redisReader *r, int enabled);
 
 #define redisReaderSetPrivdata(_r, _p) (int)(((redisReader*)(_r))->privdata = (_p))
 #define redisReaderGetObject(_r) (((redisReader*)(_r))->reply)

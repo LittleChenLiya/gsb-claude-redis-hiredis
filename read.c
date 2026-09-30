@@ -79,6 +79,12 @@ static void __redisReaderSetError(redisReader *r, int type, const char *str) {
         r->reply = NULL;
     }
 
+    /* Free any stashed attributes as well. */
+    if (r->attr != NULL && r->fn && r->fn->freeObject) {
+        r->fn->freeObject(r->attr);
+        r->attr = NULL;
+    }
+
     /* Clear input buffer on errors. */
     sdsfree(r->buf);
     r->buf = NULL;
@@ -773,6 +779,9 @@ void redisReaderFree(redisReader *r) {
     if (r->reply != NULL && r->fn && r->fn->freeObject)
         r->fn->freeObject(r->reply);
 
+    if (r->attr != NULL && r->fn && r->fn->freeObject)
+        r->fn->freeObject(r->attr);
+
     if (r->task) {
         /* We know r->task[i] is allocated if i < r->tasks */
         for (int i = 0; i < r->tasks; i++) {
@@ -830,6 +839,10 @@ int redisReaderGetReply(redisReader *r, void **reply) {
     if (r->len == 0)
         return REDIS_OK;
 
+    /* Process items until a reply can be emitted or we run out of data.
+     * Stashed attribute blocks don't produce a reply of their own, so we may
+     * have to go around more than once. */
+    for (;;) {
     /* Set first item to process when the stack is empty. */
     if (r->ridx == -1) {
         r->task[0]->type = -1;
@@ -858,14 +871,57 @@ int redisReaderGetReply(redisReader *r, void **reply) {
         r->len = sdslen(r->buf);
     }
 
-    /* Emit a reply when there is one. */
-    if (r->ridx == -1) {
-        if (reply != NULL) {
-            *reply = r->reply;
-        } else if (r->reply != NULL && r->fn && r->fn->freeObject) {
-            r->fn->freeObject(r->reply);
+    /* Nothing complete yet. */
+    if (r->ridx != -1)
+        return REDIS_OK;
+
+    /* In attribute attach mode, a completed top-level attribute reply is not
+     * emitted.  Instead it is stashed (merging consecutive attribute blocks
+     * into a single ordered key/value list) and attached to the next
+     * non-push reply. */
+    if (r->attachattrs && r->fn && r->fn->mergeAttr && r->fn->attachAttr) {
+        int roottype = r->task[0]->type;
+
+        if (roottype == REDIS_REPLY_ATTR) {
+            if (r->attr == NULL) {
+                r->attr = r->reply;
+            } else {
+                void *merged = r->fn->mergeAttr(r->attr, r->reply);
+                if (merged == NULL) {
+                    __redisReaderSetErrorOOM(r);
+                    return REDIS_ERR;
+                }
+                r->attr = merged;
+            }
+            r->reply = NULL;
+
+            /* Wait for the reply these attributes belong to when nothing
+             * else is buffered. */
+            if (r->pos == r->len)
+                return REDIS_OK;
+
+            continue;
         }
-        r->reply = NULL;
+
+        /* Push messages are delivered on their own; stashed attributes stay
+         * pending for the next non-push reply. */
+        if (roottype != REDIS_REPLY_PUSH && r->attr != NULL) {
+            r->fn->attachAttr(r->reply, r->attr);
+            r->attr = NULL;
+        }
     }
+
+    /* Emit a reply when there is one. */
+    if (reply != NULL) {
+        *reply = r->reply;
+    } else if (r->reply != NULL && r->fn && r->fn->freeObject) {
+        r->fn->freeObject(r->reply);
+    }
+    r->reply = NULL;
     return REDIS_OK;
+    }
+}
+
+void redisReaderSetAttachAttrs(redisReader *r, int enabled) {
+    r->attachattrs = enabled ? 1 : 0;
 }

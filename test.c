@@ -964,6 +964,322 @@ static void test_reply_reader(void) {
     redisReaderFree(reader);
 }
 
+/* Counting allocators used to verify that the reader's attribute attach mode
+ * frees everything it allocates, both on the success, error and free paths.
+ * Optionally fails every allocation attempt from a given index onwards. */
+static int attach_attrs_alloc_count; /* currently live blocks */
+static int attach_attrs_alloc_total; /* allocation attempts so far */
+static int attach_attrs_fail_after = -1; /* attempt to start failing at */
+
+static int counting_should_fail(void) {
+    int attempt = attach_attrs_alloc_total++;
+    return attach_attrs_fail_after >= 0 && attempt >= attach_attrs_fail_after;
+}
+
+static void *counting_malloc(size_t size) {
+    void *ptr;
+    if (counting_should_fail())
+        return NULL;
+    ptr = malloc(size);
+    if (ptr != NULL) attach_attrs_alloc_count++;
+    return ptr;
+}
+
+static void *counting_calloc(size_t nmemb, size_t size) {
+    void *ptr;
+    if (counting_should_fail())
+        return NULL;
+    ptr = calloc(nmemb, size);
+    if (ptr != NULL) attach_attrs_alloc_count++;
+    return ptr;
+}
+
+static void *counting_realloc(void *ptr, size_t size) {
+    void *newptr;
+    if (counting_should_fail())
+        return NULL;
+    newptr = realloc(ptr, size);
+    if (newptr != NULL && ptr == NULL) attach_attrs_alloc_count++;
+    return newptr;
+}
+
+static char *counting_strdup(const char *str) {
+    char *copy;
+    if (counting_should_fail())
+        return NULL;
+    copy = strdup(str);
+    if (copy != NULL) attach_attrs_alloc_count++;
+    return copy;
+}
+
+static void counting_free(void *ptr) {
+    if (ptr != NULL) attach_attrs_alloc_count--;
+    free(ptr);
+}
+
+static void test_reply_reader_attach_attrs(void) {
+    redisReader *reader;
+    redisReply *reply;
+    hiredisAllocFuncs ha = {
+        .mallocFn = counting_malloc,
+        .callocFn = counting_calloc,
+        .reallocFn = counting_realloc,
+        .strdupFn = counting_strdup,
+        .freeFn = counting_free,
+    };
+    void *r;
+    int ret, ok, baseline, i;
+
+    /* An attribute block, a push message and a normal reply concatenated in
+     * a single stream. */
+    const char *stream =
+        "|1\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"
+        ">2\r\n$7\r\nmessage\r\n$4\r\nchan\r\n"
+        "+OK\r\n";
+
+    /* Two consecutive attribute blocks with a duplicate key, followed by a
+     * normal reply. */
+    const char *merged_stream =
+        "|1\r\n$3\r\nfoo\r\n:1\r\n"
+        "|2\r\n$3\r\nfoo\r\n:2\r\n$3\r\nbar\r\n:3\r\n"
+        ":42\r\n";
+
+    /* An attribute block holding nested aggregate values. */
+    const char *nested_stream =
+        "|2\r\n$3\r\nkey\r\n*2\r\n:1\r\n:2\r\n$3\r\nmap\r\n%1\r\n$1\r\na\r\n$1\r\nb\r\n"
+        "+OK\r\n";
+
+    hiredisSetAllocators(&ha);
+    baseline = attach_attrs_alloc_count;
+
+    test("Attributes attach to the next non-push reply (byte-by-byte feed): ");
+    reader = redisReaderCreate();
+    redisReaderSetAttachAttrs(reader, 1);
+    {
+        redisReply *replies[4];
+        int nreplies = 0;
+        ok = 1;
+        for (i = 0; i < (int)strlen(stream); i++) {
+            r = NULL;
+            if (redisReaderFeed(reader, stream + i, 1) != REDIS_OK ||
+                redisReaderGetReply(reader, &r) != REDIS_OK) {
+                ok = 0;
+                break;
+            }
+            if (r != NULL) {
+                if (nreplies == 4) {
+                    freeReplyObject(r);
+                    ok = 0;
+                    break;
+                }
+                replies[nreplies++] = r;
+            }
+        }
+        /* The push message must be delivered on its own (no attributes),
+         * and the stashed attributes must be attached to the status reply
+         * that follows it. */
+        if (ok) {
+            ok = nreplies == 2 &&
+                 replies[0]->type == REDIS_REPLY_PUSH &&
+                 replies[0]->attr == NULL &&
+                 replies[0]->elements == 2 &&
+                 replies[0]->element[0]->type == REDIS_REPLY_STRING &&
+                 replies[0]->element[0]->len == 7 &&
+                 memcmp(replies[0]->element[0]->str, "message", 7) == 0 &&
+                 replies[1]->type == REDIS_REPLY_STATUS &&
+                 replies[1]->attr != NULL &&
+                 replies[1]->attr->type == REDIS_REPLY_ATTR &&
+                 replies[1]->attr->elements == 2 &&
+                 replies[1]->attr->element[0]->type == REDIS_REPLY_STRING &&
+                 replies[1]->attr->element[0]->len == 3 &&
+                 memcmp(replies[1]->attr->element[0]->str, "key", 3) == 0 &&
+                 replies[1]->attr->element[1]->type == REDIS_REPLY_STRING &&
+                 replies[1]->attr->element[1]->len == 5 &&
+                 memcmp(replies[1]->attr->element[1]->str, "value", 5) == 0;
+        }
+        while (nreplies > 0)
+            freeReplyObject(replies[--nreplies]);
+    }
+    redisReaderFree(reader);
+    test_cond(ok);
+
+    test("Byte-by-byte attach scenario frees all allocations: ");
+    test_cond(attach_attrs_alloc_count == baseline);
+
+    test("Consecutive attribute blocks merge, preserving order and duplicate keys: ");
+    reader = redisReaderCreate();
+    redisReaderSetAttachAttrs(reader, 1);
+    redisReaderFeed(reader, merged_stream, strlen(merged_stream));
+    r = NULL;
+    ret = redisReaderGetReply(reader, &r);
+    reply = r;
+    ok = ret == REDIS_OK && reply != NULL &&
+         reply->type == REDIS_REPLY_INTEGER && reply->integer == 42 &&
+         reply->attr != NULL && reply->attr->type == REDIS_REPLY_ATTR &&
+         reply->attr->elements == 6;
+    if (ok) {
+        const char *keys[3] = { "foo", "foo", "bar" };
+        for (i = 0; i < 3 && ok; i++) {
+            redisReply *k = reply->attr->element[i * 2];
+            redisReply *v = reply->attr->element[i * 2 + 1];
+            ok = k->type == REDIS_REPLY_STRING && k->len == 3 &&
+                 memcmp(k->str, keys[i], 3) == 0 &&
+                 v->type == REDIS_REPLY_INTEGER &&
+                 v->integer == (long long)(i + 1);
+        }
+    }
+    test_cond(ok);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Merged attribute scenario frees all allocations: ");
+    test_cond(attach_attrs_alloc_count == baseline);
+
+    test("Attribute block without a following reply is stashed, not emitted: ");
+    reader = redisReaderCreate();
+    redisReaderSetAttachAttrs(reader, 1);
+    redisReaderFeed(reader, "|1\r\n$3\r\nkey\r\n$5\r\nvalue\r\n", 24);
+    r = NULL;
+    ret = redisReaderGetReply(reader, &r);
+    test_cond(ret == REDIS_OK && r == NULL);
+    redisReaderFree(reader);
+
+    test("Stashed attributes are freed when the reader is freed: ");
+    test_cond(attach_attrs_alloc_count == baseline);
+
+    test("Truncated attribute block produces no reply and no error: ");
+    reader = redisReaderCreate();
+    redisReaderSetAttachAttrs(reader, 1);
+    redisReaderFeed(reader, "|1\r\n$3\r\nke", 10);
+    r = NULL;
+    ret = redisReaderGetReply(reader, &r);
+    test_cond(ret == REDIS_OK && r == NULL);
+    redisReaderFree(reader);
+
+    test("Truncated input frees all allocations: ");
+    test_cond(attach_attrs_alloc_count == baseline);
+
+    test("Attributes with nested aggregate values attach correctly: ");
+    reader = redisReaderCreate();
+    redisReaderSetAttachAttrs(reader, 1);
+    redisReaderFeed(reader, nested_stream, strlen(nested_stream));
+    r = NULL;
+    ret = redisReaderGetReply(reader, &r);
+    reply = r;
+    ok = ret == REDIS_OK && reply != NULL &&
+         reply->type == REDIS_REPLY_STATUS &&
+         reply->attr != NULL && reply->attr->type == REDIS_REPLY_ATTR &&
+         reply->attr->elements == 4 &&
+         reply->attr->element[1]->type == REDIS_REPLY_ARRAY &&
+         reply->attr->element[1]->elements == 2 &&
+         reply->attr->element[1]->element[0]->integer == 1 &&
+         reply->attr->element[1]->element[1]->integer == 2 &&
+         reply->attr->element[3]->type == REDIS_REPLY_MAP &&
+         reply->attr->element[3]->elements == 2 &&
+         reply->attr->element[3]->element[0]->len == 1 &&
+         memcmp(reply->attr->element[3]->element[0]->str, "a", 1) == 0 &&
+         reply->attr->element[3]->element[1]->len == 1 &&
+         memcmp(reply->attr->element[3]->element[1]->str, "b", 1) == 0;
+    test_cond(ok);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Nested attribute scenario frees all allocations: ");
+    test_cond(attach_attrs_alloc_count == baseline);
+
+    test("Attribute blocks obey maxelements and the error frees the stash: ");
+    reader = redisReaderCreate();
+    redisReaderSetAttachAttrs(reader, 1);
+    reader->maxelements = 1;
+    {
+        const char *limit_stream =
+            "|1\r\n$3\r\nkey\r\n:1\r\n"
+            "|2\r\n$1\r\na\r\n:1\r\n$1\r\nb\r\n:2\r\n";
+        redisReaderFeed(reader, limit_stream, strlen(limit_stream));
+    }
+    r = NULL;
+    ret = redisReaderGetReply(reader, &r);
+    test_cond(ret == REDIS_ERR && reader->err == REDIS_ERR_PROTOCOL &&
+              strcasecmp(reader->errstr, "Multi-bulk length out of range") == 0);
+    redisReaderFree(reader);
+
+    test("The maxelements error path frees all allocations: ");
+    test_cond(attach_attrs_alloc_count == baseline);
+
+    test("Nested values inside attributes obey maxdepth: ");
+    reader = redisReaderCreate();
+    redisReaderSetAttachAttrs(reader, 1);
+    reader->maxdepth = 2;
+    {
+        const char *depth_stream = "|1\r\n$1\r\nk\r\n*1\r\n*1\r\n*1\r\n:1\r\n";
+        redisReaderFeed(reader, depth_stream, strlen(depth_stream));
+    }
+    r = NULL;
+    ret = redisReaderGetReply(reader, &r);
+    test_cond(ret == REDIS_ERR &&
+              strcasecmp(reader->errstr, "Max nesting depth exceeded") == 0);
+    redisReaderFree(reader);
+
+    test("The maxdepth error path frees all allocations: ");
+    test_cond(attach_attrs_alloc_count == baseline);
+
+    test("Without attach mode, attributes are delivered as their own reply: ");
+    reader = redisReaderCreate();
+    {
+        const char *plain_stream = "|1\r\n$3\r\nkey\r\n:1\r\n:42\r\n";
+        redisReaderFeed(reader, plain_stream, strlen(plain_stream));
+    }
+    r = NULL;
+    ret = redisReaderGetReply(reader, &r);
+    reply = r;
+    ok = ret == REDIS_OK && reply != NULL &&
+         reply->type == REDIS_REPLY_ATTR && reply->attr == NULL &&
+         reply->elements == 2;
+    freeReplyObject(reply);
+    r = NULL;
+    ret = redisReaderGetReply(reader, &r);
+    reply = r;
+    ok = ok && ret == REDIS_OK && reply != NULL &&
+         reply->type == REDIS_REPLY_INTEGER && reply->integer == 42 &&
+         reply->attr == NULL;
+    test_cond(ok);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    /* Fail every allocation attempt from index i onwards and make sure no
+     * allocation is ever leaked, whichever attempt fails. */
+    test("Attach mode OOM paths free everything (fault injection): ");
+    ok = 1;
+    {
+        int saw_success = 0;
+        for (i = 0; i < 128 && !saw_success; i++) {
+            attach_attrs_alloc_count = 0;
+            attach_attrs_alloc_total = 0;
+            attach_attrs_fail_after = i;
+
+            reader = redisReaderCreate();
+            if (reader != NULL) {
+                redisReaderSetAttachAttrs(reader, 1);
+                redisReaderFeed(reader, merged_stream, strlen(merged_stream));
+                r = NULL;
+                ret = redisReaderGetReply(reader, &r);
+                if (ret == REDIS_OK && r != NULL) {
+                    saw_success = 1;
+                    freeReplyObject(r);
+                }
+                redisReaderFree(reader);
+            }
+            if (attach_attrs_alloc_count != 0)
+                ok = 0;
+        }
+        attach_attrs_fail_after = -1;
+        ok = ok && saw_success;
+    }
+    test_cond(ok);
+
+    hiredisResetAllocators();
+}
+
 static void test_free_null(void) {
     void *redisCtx = NULL;
     void *reply = NULL;
@@ -2745,6 +3061,7 @@ int main(int argc, char **argv) {
 
     test_format_commands();
     test_reply_reader();
+    test_reply_reader_attach_attrs();
     test_blocking_connection_errors();
     test_free_null();
 #ifdef __linux__

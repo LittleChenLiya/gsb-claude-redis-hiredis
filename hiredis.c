@@ -63,6 +63,8 @@ static void *createIntegerObject(const redisReadTask *task, long long value);
 static void *createDoubleObject(const redisReadTask *task, double value, char *str, size_t len);
 static void *createNilObject(const redisReadTask *task);
 static void *createBoolObject(const redisReadTask *task, int bval);
+static void *mergeAttrObject(void *dst, void *src);
+static void attachAttrObject(void *reply, void *attr);
 
 /* Default set of functions to build the reply. Keep in mind that such a
  * function returning NULL is interpreted as OOM. */
@@ -73,7 +75,9 @@ static redisReplyObjectFunctions defaultFunctions = {
     createDoubleObject,
     createNilObject,
     createBoolObject,
-    freeReplyObject
+    freeReplyObject,
+    mergeAttrObject,
+    attachAttrObject
 };
 
 /* Create a reply object */
@@ -94,6 +98,10 @@ void freeReplyObject(void *reply) {
 
     if (r == NULL)
         return;
+
+    /* Free any RESP3 attributes attached to this reply. */
+    if (r->attr != NULL)
+        freeReplyObject(r->attr);
 
     switch(r->type) {
     case REDIS_REPLY_INTEGER:
@@ -299,6 +307,50 @@ static void *createBoolObject(const redisReadTask *task, int bval) {
         parent->element[task->idx] = r;
     }
     return r;
+}
+
+/* Merge two REDIS_REPLY_ATTR replies into a single ordered key/value list,
+ * preserving order and duplicate keys.  The elements of 'src' are moved into
+ * 'dst' and the emptied 'src' shell is freed.  Returns the merged reply, or
+ * NULL on allocation failure with both replies left intact. */
+static void *mergeAttrObject(void *dst, void *src) {
+    redisReply *d = dst, *s = src;
+    redisReply **aux;
+    size_t elements;
+
+    assert(d->type == REDIS_REPLY_ATTR && s->type == REDIS_REPLY_ATTR);
+
+    if (s->elements > 0) {
+        if (s->elements > SIZE_MAX - d->elements)
+            return NULL;
+        elements = d->elements + s->elements;
+        if (elements > SIZE_MAX / sizeof(*d->element))
+            return NULL;
+
+        aux = hi_realloc(d->element, elements * sizeof(*d->element));
+        if (aux == NULL)
+            return NULL;
+
+        memcpy(aux + d->elements, s->element, s->elements * sizeof(*s->element));
+        d->element = aux;
+        d->elements = elements;
+    }
+
+    /* The source elements were stolen, so free the shell only. */
+    hi_free(s->element);
+    s->element = NULL;
+    s->elements = 0;
+    freeReplyObject(s);
+
+    return d;
+}
+
+/* Attach a stashed RESP3 attribute reply to its reply object. */
+static void attachAttrObject(void *reply, void *attr) {
+    redisReply *r = reply;
+
+    assert(r->attr == NULL);
+    r->attr = attr;
 }
 
 /* Return the number of digits of 'v' when converted to string in radix 10.

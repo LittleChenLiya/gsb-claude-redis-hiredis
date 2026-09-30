@@ -806,6 +806,21 @@ If you have a unique use-case where you don't want hiredis to automatically inte
 
     _Note:  With no handler configured, calls to `redisCommand` may generate more than one reply, so this strategy is only applicable when there's some kind of blocking `redisGetReply()` loop (e.g. `MONITOR` or `SUBSCRIBE` workloads)._
 
+## RESP3 attribute replies
+RESP3 attribute replies (reply-type `|`) carry out-of-band meta-data about the reply that follows them.  By default hiredis delivers them as standalone `REDIS_REPLY_ATTR` replies, but the reader can optionally attach them to the reply they describe instead:
+
+```c
+redisReaderSetAttachAttrs(context->reader, 1);
+```
+
+When the attach mode is enabled:
+
+* Top-level attribute blocks are no longer delivered as their own reply.  Consecutive attribute blocks are merged into a single ordered key/value list (duplicate keys are preserved, nothing is overwritten) which is attached to the next non-push reply.
+* The attributes are exposed through the `attr` member of `redisReply`, as a `REDIS_REPLY_ATTR` reply whose elements alternate between keys and values.  `attr` is `NULL` when no attributes preceded the reply, and is freed automatically by `freeReplyObject()`.
+* Interleaved PUSH messages are still delivered on their own; any stashed attributes remain pending for the next non-push reply.
+
+The mode is implemented in the protocol reader, so it works for both blocking and asynchronous contexts.  Custom `redisReplyObjectFunctions` must provide the `mergeAttr`/`attachAttr` hooks for the mode to take effect; with the default reply objects this is already wired up.
+
 ## Allocator injection
 
 Hiredis uses a pass-thru structure of function pointers defined in [alloc.h](https://github.com/redis/hiredis/blob/f5d25850/alloc.h#L41) that contain the currently configured allocation and deallocation functions.  By default they just point to libc (`malloc`, `calloc`, `realloc`, etc).
