@@ -123,6 +123,24 @@ void redisReaderFree(redisReader *r);
 int redisReaderFeed(redisReader *r, const char *buf, size_t len);
 int redisReaderGetReply(redisReader *r, void **reply);
 
+/* Reset a reader back to its freshly-created parsing state so it can be
+ * reused after a protocol (or other) error. This releases any partially
+ * built reply, clears the parse stack, the error state and the input buffer,
+ * but preserves the caller-configured reply object functions, privdata and
+ * limits (maxbuf, maxelements, maxdepth).
+ *
+ * Replies already delivered through redisReaderGetReply() are owned by the
+ * caller and are never freed or otherwise touched by the reader.
+ *
+ * While a reader is in an erroneous state, redisReaderFeed() and
+ * redisReaderGetReply() keep failing until a reset succeeds, so half-fed
+ * stale data can never be mixed into a subsequent reply. Calling reset on a
+ * fresh reader or calling it repeatedly is safe.
+ *
+ * Returns REDIS_OK on success. On (out-of-memory) failure the reader stays
+ * in an erroneous state and must not be used until a later reset succeeds. */
+int redisReaderReset(redisReader *r);
+
 #define redisReaderSetPrivdata(_r, _p) (int)(((redisReader*)(_r))->privdata = (_p))
 #define redisReaderGetObject(_r) (((redisReader*)(_r))->reply)
 #define redisReaderGetError(_r) (((redisReader*)(_r))->errstr)

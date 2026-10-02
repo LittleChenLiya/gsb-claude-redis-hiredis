@@ -786,6 +786,51 @@ void redisReaderFree(redisReader *r) {
     hi_free(r);
 }
 
+int redisReaderReset(redisReader *r) {
+    if (r == NULL)
+        return REDIS_ERR;
+
+    /* Free a partially built reply, if any. Replies already delivered to the
+     * caller via redisReaderGetReply() are no longer referenced by the reader
+     * and are never touched here. */
+    if (r->reply != NULL && r->fn && r->fn->freeObject) {
+        r->fn->freeObject(r->reply);
+        r->reply = NULL;
+    }
+
+    /* Drop buffered (possibly half-consumed) input. */
+    sdsfree(r->buf);
+    r->buf = sdsempty();
+    if (r->buf == NULL) {
+        /* Leave the reader in an erroneous state: it must not be fed again
+         * until a reset succeeds. */
+        r->err = REDIS_ERR_OOM;
+        memcpy(r->errstr,"Out of memory",sizeof("Out of memory"));
+        return REDIS_ERR;
+    }
+    r->pos = r->len = 0;
+
+    /* Reset the parse stack. The task slots themselves stay allocated; clear
+     * stale object pointers left over from the aborted reply (they pointed
+     * into the tree freed above). */
+    for (int i = 0; i < r->tasks; i++) {
+        r->task[i]->type = -1;
+        r->task[i]->elements = -1;
+        r->task[i]->idx = -1;
+        r->task[i]->obj = NULL;
+        r->task[i]->parent = NULL;
+    }
+    r->ridx = -1;
+
+    /* Clear error state. The reply object functions, privdata and the
+     * configured limits (maxbuf, maxelements, maxdepth) are intentionally
+     * preserved. */
+    r->err = 0;
+    r->errstr[0] = '\0';
+
+    return REDIS_OK;
+}
+
 int redisReaderFeed(redisReader *r, const char *buf, size_t len) {
     sds newbuf;
 

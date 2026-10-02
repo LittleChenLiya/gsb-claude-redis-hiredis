@@ -269,6 +269,14 @@ endif
 hiredis-test: test.o $(TEST_LIBS)
 	$(CC) -o $@ $(REAL_CFLAGS) -I. $^ $(REAL_LDFLAGS) $(TEST_LDFLAGS)
 
+# Standalone redisReaderReset() acceptance test: no redis-server needed,
+# links only the reader, sds and alloc translation units.
+reader-reset-test: test_reader_reset.c read.c sds.c alloc.c read.h alloc.h sds.h
+	$(CC) -o $@ $(REAL_CFLAGS) -I. test_reader_reset.c read.c sds.c alloc.c $(REAL_LDFLAGS)
+
+test-reader-reset: reader-reset-test
+	./reader-reset-test
+
 hiredis-%: %.o $(STLIBNAME)
 	$(CC) $(REAL_CFLAGS) -o $@ $< $(TEST_LIBS) $(REAL_LDFLAGS)
 
@@ -282,7 +290,7 @@ check: hiredis-test
 	$(CC) -std=c99 -c $(REAL_CFLAGS) $<
 
 clean:
-	rm -rf $(DYLIBNAME) $(STLIBNAME) $(SSL_DYLIBNAME) $(SSL_STLIBNAME) $(TESTS) $(PKGCONFNAME) examples/hiredis-example* *.o *.gcda *.gcno *.gcov
+	rm -rf $(DYLIBNAME) $(STLIBNAME) $(SSL_DYLIBNAME) $(SSL_STLIBNAME) $(TESTS) $(PKGCONFNAME) examples/hiredis-example* reader-reset-test *.o *.gcda *.gcno *.gcov
 
 dep:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MM *.c
@@ -363,4 +371,4 @@ coverage: gcov
 noopt:
 	$(MAKE) OPTIMIZATION=""
 
-.PHONY: all test check clean dep install 32bit 32bit-vars gprof gcov noopt
+.PHONY: all test check test-reader-reset clean dep install 32bit 32bit-vars gprof gcov noopt
