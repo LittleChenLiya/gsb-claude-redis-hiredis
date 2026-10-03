@@ -786,6 +786,41 @@ void redisReaderFree(redisReader *r) {
     hi_free(r);
 }
 
+void redisReaderReset(redisReader *r) {
+    if (r == NULL)
+        return;
+
+    /* Free the reply that was being built. Replies already delivered to the
+     * caller are no longer referenced by r->reply (it is cleared in
+     * redisReaderGetReply), so they are owned by the caller and are not
+     * touched here. */
+    if (r->reply != NULL && r->fn && r->fn->freeObject)
+        r->fn->freeObject(r->reply);
+    r->reply = NULL;
+
+    /* Discard any buffered input and reset the parse stack to its initial
+     * state. The task array itself is scratch space that is re-initialized
+     * before reuse, so it is retained: this makes reset allocation-free and
+     * thus safe to call repeatedly. */
+    sdsfree(r->buf);
+    r->buf = sdsempty();
+    if (r->buf == NULL) {
+        /* sdsempty() only fails on OOM; leave the reader in the error state
+         * so feeding stays blocked until another reset succeeds. */
+        __redisReaderSetErrorOOM(r);
+        return;
+    }
+    r->pos = r->len = 0;
+    r->ridx = -1;
+
+    /* Clear the error so the reader can be fed again. */
+    r->err = 0;
+    r->errstr[0] = '\0';
+
+    /* NOTE: fn, privdata, maxbuf, maxelements and maxdepth are intentionally
+     * preserved across a reset. */
+}
+
 int redisReaderFeed(redisReader *r, const char *buf, size_t len) {
     sds newbuf;
 

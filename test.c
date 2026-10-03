@@ -22,6 +22,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
+#ifdef __MINGW32__
+/* millisleep() uses usleep(3); declare it directly here instead of including
+ * <unistd.h>, whose close() declaration conflicts with the close() macro in
+ * sockcompat.h. */
+extern int usleep(unsigned int);
+#endif
 
 #include "hiredis.h"
 #include "async.h"
@@ -962,6 +968,212 @@ static void test_reply_reader(void) {
         strcmp(((redisReply*)reply)->element[0]->str, "3.14159265358979323846") == 0);
     freeReplyObject(reply);
     redisReaderFree(reader);
+}
+
+/* Counting allocator with optional Nth-allocation failure, used to verify
+ * that reset frees half-built replies without double-freeing delivered ones,
+ * and that it recovers from out-of-memory errors. */
+static struct {
+    int live;       /* current number of live allocations */
+    int allocs;     /* total successful allocations */
+    int frees;      /* total frees */
+    int fail_at;    /* fail the Nth allocation (1-based); 0 disables */
+} cnt;
+
+#define CNT_HDR sizeof(size_t)
+static void *cnt_malloc(size_t size) {
+    if (cnt.fail_at != 0 && cnt.allocs + 1 == cnt.fail_at) {
+        cnt.fail_at = 0;
+        return NULL;
+    }
+    size_t *p = (size_t*)malloc(CNT_HDR + size);
+    if (p == NULL) return NULL;
+    *p = size;
+    cnt.live++;
+    cnt.allocs++;
+    return (void*)(p + 1);
+}
+
+static void cnt_free(void *ptr) {
+    if (ptr == NULL) return;
+    size_t *p = (size_t*)ptr - 1;
+    cnt.live--;
+    cnt.frees++;
+    free(p);
+}
+
+static void *cnt_calloc(size_t nmemb, size_t size) {
+    if (cnt.fail_at != 0 && cnt.allocs + 1 == cnt.fail_at) {
+        cnt.fail_at = 0;
+        return NULL;
+    }
+    if (size != 0 && nmemb > SIZE_MAX / size) return NULL;
+    size_t total = nmemb * size;
+    size_t *p = (size_t*)calloc(1, CNT_HDR + total);
+    if (p == NULL) return NULL;
+    *p = total;
+    cnt.live++;
+    cnt.allocs++;
+    return (void*)(p + 1);
+}
+
+static void *cnt_realloc(void *ptr, size_t size) {
+    if (ptr == NULL) return cnt_malloc(size);
+    if (size == 0) { cnt_free(ptr); return NULL; }
+    size_t *old = (size_t*)ptr - 1;
+    size_t oldsize = *old;
+    void *p = cnt_malloc(size);
+    if (p == NULL) return NULL;
+    memcpy(p, ptr, oldsize < size ? oldsize : size);
+    cnt_free(ptr);
+    return p;
+}
+
+static char *cnt_strdup(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *p = (char*)cnt_malloc(len);
+    if (p != NULL) memcpy(p, s, len);
+    return p;
+}
+
+static void cnt_reset(void) {
+    cnt.live = cnt.allocs = cnt.frees = 0;
+    cnt.fail_at = 0;
+}
+
+static hiredisAllocFuncs cnt_funcs(void) {
+    hiredisAllocFuncs ha = {
+        .mallocFn = cnt_malloc,
+        .callocFn = cnt_calloc,
+        .reallocFn = cnt_realloc,
+        .strdupFn = cnt_strdup,
+        .freeFn = cnt_free,
+    };
+    return ha;
+}
+
+static void test_reply_reader_reset(void) {
+    redisReader *reader;
+    void *reply;
+    int ret;
+
+    test("Reset after protocol error allows reuse (PING/PONG): ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader,(char*)"*2\r\n$5\r\nhello\r\n",15);
+    redisReaderFeed(reader,(char*)"@foo\r\n",6);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_ERR && reply == NULL &&
+              strcasecmp(reader->errstr,
+                  "Protocol error, got \"@\" as reply type byte") == 0);
+    /* Feeding new data before reset must be rejected. */
+    ret = redisReaderFeed(reader,(char*)"+PONG\r\n",7);
+    test_cond(ret == REDIS_ERR);
+    /* Repeated reset and empty-state reset are safe. */
+    redisReaderReset(reader);
+    redisReaderReset(reader);
+    redisReaderReset(NULL);
+    ret = redisReaderFeed(reader,(char*)"+PONG\r\n",7);
+    assert(ret == REDIS_OK);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply != NULL &&
+              ((redisReply*)reply)->type == REDIS_REPLY_STATUS &&
+              !memcmp(((redisReply*)reply)->str,"PONG",4));
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Reset frees half-built reply, delivered reply not double-freed: ");
+    cnt_reset();
+    hiredisAllocFuncs ha = cnt_funcs();
+    hiredisSetAllocators(&ha);
+
+    reader = redisReaderCreate();
+    int baseline = cnt.live;
+
+    /* A protocol error frees the half-built reply; reset must not free it
+     * again, and a reply already delivered to the caller must not be freed
+     * by the reader at all. */
+    redisReaderFeed(reader,(char*)"*2\r\n$5\r\nhello\r\n",15);
+    redisReaderFeed(reader,(char*)"@foo\r\n",6);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_ERR);
+    /* The error path frees the half-built reply and the buffered input. */
+    test_cond(cnt.live < baseline);
+    redisReaderReset(reader);
+    test_cond(cnt.live == baseline);
+    ret = redisReaderFeed(reader,(char*)"+PONG\r\n",7);
+    assert(ret == REDIS_OK);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL);
+    test_cond(cnt.live == baseline + 2); /* reply object + its string */
+    freeReplyObject(reply);
+    test_cond(cnt.live == baseline);
+    redisReaderFree(reader);
+    test_cond(cnt.live == 0);
+
+    /* Reset also aborts a partial parse (no error) and frees the half-built
+     * reply. */
+    cnt_reset();
+    hiredisSetAllocators(&ha);
+    reader = redisReaderCreate();
+    baseline = cnt.live;
+    redisReaderFeed(reader,(char*)"*2\r\n$5\r\nhello\r\n",15);
+    /* The reply tree is only allocated when GetReply parses the data. */
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply == NULL);
+    test_cond(cnt.live > baseline);
+    redisReaderReset(reader);
+    test_cond(cnt.live == baseline);
+    ret = redisReaderFeed(reader,(char*)"+PONG\r\n",7);
+    assert(ret == REDIS_OK);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply != NULL);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+    test_cond(cnt.live == 0);
+
+    hiredisResetAllocators();
+
+    test("Reset preserves reply functions, private data and limits: ");
+    static redisReplyObjectFunctions custom_fn;
+    reader = redisReaderCreateWithFunctions(&custom_fn);
+    reader->maxdepth = 42;
+    reader->maxelements = 123;
+    reader->maxbuf = 456;
+    reader->privdata = (void*)(uintptr_t)0xdeadbeef;
+    redisReaderReset(reader);
+    test_cond(reader->fn == &custom_fn &&
+              reader->maxdepth == 42 &&
+              reader->maxelements == 123 &&
+              reader->maxbuf == 456 &&
+              reader->privdata == (void*)(uintptr_t)0xdeadbeef);
+    redisReaderFree(reader);
+
+    test("Memory failure injection: reset recovers from OOM: ");
+    int oom_hit = 0;
+    for (int n = 1; n <= 20; n++) {
+        cnt_reset();
+        hiredisSetAllocators(&ha);
+        redisReader *r = redisReaderCreate();
+        cnt.fail_at = cnt.allocs + n;
+        redisReaderFeed(r,(char*)"*2\r\n$5\r\nhello\r\n",15);
+        ret = redisReaderGetReply(r,&reply);
+        if (ret == REDIS_ERR && r->err == REDIS_ERR_OOM) {
+            oom_hit = 1;
+            /* Feeding stays blocked until reset succeeds. */
+            assert(redisReaderFeed(r,(char*)"+PONG\r\n",7) == REDIS_ERR);
+            redisReaderReset(r);
+            assert(redisReaderFeed(r,(char*)"+PONG\r\n",7) == REDIS_OK);
+            ret = redisReaderGetReply(r,&reply);
+            assert(ret == REDIS_OK && reply != NULL);
+            freeReplyObject(reply);
+            redisReaderFree(r);
+            break;
+        }
+        if (reply != NULL) freeReplyObject(reply);
+        redisReaderFree(r);
+    }
+    test_cond(oom_hit && cnt.live == 0);
+    hiredisResetAllocators();
 }
 
 static void test_free_null(void) {
@@ -2745,6 +2957,7 @@ int main(int argc, char **argv) {
 
     test_format_commands();
     test_reply_reader();
+    test_reply_reader_reset();
     test_blocking_connection_errors();
     test_free_null();
 #ifdef __linux__

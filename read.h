@@ -123,6 +123,27 @@ void redisReaderFree(redisReader *r);
 int redisReaderFeed(redisReader *r, const char *buf, size_t len);
 int redisReaderGetReply(redisReader *r, void **reply);
 
+/* Reset a reader so it can be reused to parse a fresh stream of replies.
+ *
+ * A reader enters an error state when a protocol (or OOM) error occurs;
+ * redisReaderFeed() and redisReaderGetReply() then keep failing until the
+ * reader is explicitly reset. Call this function after an error (or simply
+ * to abort a partially parsed reply) before feeding new data.
+ *
+ * Resetting releases the reply currently being built and any buffered input,
+ * resets the internal parse stack and clears the error. The reply object
+ * functions, private data and limits (maxbuf, maxelements, maxdepth) that
+ * were configured by the caller are preserved.
+ *
+ * Replies that were already delivered to the caller through
+ * redisReaderGetReply() are owned by the caller and are never freed by the
+ * reader, so they are not touched here.
+ *
+ * This function does not allocate and therefore cannot fail; it is safe to
+ * call repeatedly, and safe to call on a reader that has just been created
+ * or that has no pending state. */
+void redisReaderReset(redisReader *r);
+
 #define redisReaderSetPrivdata(_r, _p) (int)(((redisReader*)(_r))->privdata = (_p))
 #define redisReaderGetObject(_r) (((redisReader*)(_r))->reply)
 #define redisReaderGetError(_r) (((redisReader*)(_r))->errstr)
