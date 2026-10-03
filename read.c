@@ -132,6 +132,213 @@ static void __redisReaderSetErrorOOM(redisReader *r) {
     __redisReaderSetError(r,REDIS_ERR_OOM,"Out of memory");
 }
 
+/* Set a protocol error that carries the absolute byte offset (counted over
+ * the cumulative input stream, across all redisReaderFeed() calls) of the
+ * offending field. Used by the strict numeric mode. */
+static void __redisReaderSetErrorAtOffset(redisReader *r, const char *msg,
+                                          unsigned long long offset) {
+    char sbuf[128];
+    snprintf(sbuf,sizeof(sbuf),"%s at byte %llu",msg,offset);
+    __redisReaderSetError(r,REDIS_ERR_PROTOCOL,sbuf);
+}
+
+/* Strict decimal integer parse for the optional strict numeric mode.
+ *
+ * Accepts only an optional leading '-' followed by ASCII decimal digits in
+ * canonical form: no leading zeros ("0" itself is fine, "-0" is not), no
+ * whitespace, no '+' sign and no trailing garbage. The whole field must be
+ * consumed; a partial atoi()-style parse is never accepted. Overflow beyond
+ * the long long range is reported as an error before any value is produced.
+ *
+ * Returns REDIS_OK on success, REDIS_ERR otherwise. */
+static int strictParseDecimal(const char *s, size_t slen, long long *value) {
+    size_t i = 0;
+    int negative = 0;
+    unsigned long long v = 0, limit;
+
+    if (slen == 0)
+        return REDIS_ERR;
+
+    if (s[0] == '-') {
+        negative = 1;
+        i = 1;
+        if (i == slen) /* lone '-' */
+            return REDIS_ERR;
+    }
+
+    /* Canonical form: a leading zero is only allowed for the value 0. */
+    if (s[i] == '0') {
+        if (negative || slen - i != 1)
+            return REDIS_ERR;
+        if (value != NULL) *value = 0;
+        return REDIS_OK;
+    }
+
+    limit = negative ? (unsigned long long)LLONG_MAX + 1ULL
+                     : (unsigned long long)LLONG_MAX;
+
+    for (; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
+        unsigned int digit;
+        if (c < '0' || c > '9') /* hidden whitespace, junk, etc. */
+            return REDIS_ERR;
+        digit = c - '0';
+        if (v > (limit - digit) / 10ULL) /* overflow */
+            return REDIS_ERR;
+        v = v * 10ULL + digit;
+    }
+
+    if (value != NULL) {
+        if (negative) {
+            if (v == (unsigned long long)LLONG_MAX + 1ULL)
+                *value = LLONG_MIN;
+            else
+                *value = -(long long)v;
+        } else {
+            *value = (long long)v;
+        }
+    }
+    return REDIS_OK;
+}
+
+/* Strict RESP3 double parse for the optional strict numeric mode.
+ *
+ * Only two kinds of input are accepted:
+ *   1. The explicit literals "inf", "-inf", "nan" and "-nan"
+ *      (case-insensitive).
+ *   2. A finite decimal number in canonical ASCII form:
+ *        '-'? D+ ('.' D+)? (('e'|'E') ('+'|'-')? D+)?
+ *      i.e. at least one integer digit, an optional fractional part with at
+ *      least one digit, and an optional decimal exponent.
+ *
+ * Everything else is rejected: hex floats, "infinity" and other long forms,
+ * leading '+' signs, and any leading/trailing/hidden whitespace or garbage.
+ * The conversion is locale-independent: it never consults LC_NUMERIC, so
+ * "1.5" parses to the same value under any locale. */
+static int strictParseDouble(const char *s, size_t slen, double *value) {
+    size_t i = 0, intdigits, fracdigits;
+
+    if (slen == 0)
+        return REDIS_ERR;
+
+    /* Explicit inf/nan literals. */
+    if (slen == 3 && strncasecmp(s,"inf",3) == 0) {
+        *value = INFINITY;
+        return REDIS_OK;
+    }
+    if (slen == 4 && strncasecmp(s,"-inf",4) == 0) {
+        *value = -INFINITY;
+        return REDIS_OK;
+    }
+    if ((slen == 3 && strncasecmp(s,"nan",3) == 0) ||
+        (slen == 4 && strncasecmp(s,"-nan",4) == 0)) {
+        *value = NAN;
+        return REDIS_OK;
+    }
+
+    /* Finite decimal number. Validate the full grammar first so that no
+     * partially-parsed value can leak through. */
+    if (s[i] == '-') {
+        i++;
+        if (i == slen)
+            return REDIS_ERR;
+    }
+
+    intdigits = 0;
+    while (i < slen && s[i] >= '0' && s[i] <= '9') {
+        i++; intdigits++;
+    }
+    if (intdigits == 0)
+        return REDIS_ERR;
+
+    fracdigits = 0;
+    if (i < slen && s[i] == '.') {
+        i++;
+        while (i < slen && s[i] >= '0' && s[i] <= '9') {
+            i++; fracdigits++;
+        }
+        if (fracdigits == 0) /* "1." is not canonical */
+            return REDIS_ERR;
+    }
+
+    if (i < slen && (s[i] == 'e' || s[i] == 'E')) {
+        size_t expdigits = 0;
+        i++;
+        if (i < slen && (s[i] == '+' || s[i] == '-'))
+            i++;
+        while (i < slen && s[i] >= '0' && s[i] <= '9') {
+            i++; expdigits++;
+        }
+        if (expdigits == 0)
+            return REDIS_ERR;
+    }
+
+    if (i != slen) /* trailing garbage */
+        return REDIS_ERR;
+
+#ifndef HIREDIS_FLOAT_STRTOD
+    /* ffc is locale-independent and, given the grammar validated above,
+     * consumes the whole range by construction. */
+    {
+        ffc_parse_options o = ffc_parse_options_default();
+        ffc_result res;
+        o.format |= FFC_FORMAT_FLAG_NO_INFNAN;
+        res = ffc_from_chars_double_options(s, s + slen, value, o);
+        if (res.outcome != FFC_OUTCOME_OK || res.ptr != s + slen ||
+            !isfinite(*value))
+            return REDIS_ERR;
+    }
+#else
+    /* Locale-independent fallback conversion for builds that compile ffc
+     * out: gather up to 19 significant decimal digits into an integer
+     * mantissa and scale by a power of ten. Never touches strtod(), so the
+     * result does not depend on LC_NUMERIC. Note: values with more than 19
+     * significant digits may be rounded slightly differently than strtod. */
+    {
+        unsigned long long mant = 0;
+        long exp10 = 0;
+        double d;
+        size_t j = (s[0] == '-') ? 1 : 0;
+        int seen_dot = 0;
+
+        for (; j < slen && s[j] != 'e' && s[j] != 'E'; j++) {
+            if (s[j] == '.') {
+                seen_dot = 1;
+                continue;
+            }
+            if (mant <= (ULLONG_MAX - 9ULL) / 10ULL) {
+                mant = mant * 10ULL + (unsigned)(s[j] - '0');
+                if (seen_dot) exp10--;
+            } else if (!seen_dot) {
+                exp10++; /* dropped low-significance integer digits */
+            }
+        }
+        if (j < slen) { /* exponent */
+            long e = 0;
+            int eneg = 0;
+            j++;
+            if (s[j] == '+' || s[j] == '-') {
+                eneg = (s[j] == '-');
+                j++;
+            }
+            for (; j < slen; j++) {
+                if (e < 100000) /* clamp; pow() saturates anyway */
+                    e = e * 10 + (s[j] - '0');
+            }
+            exp10 += eneg ? -e : e;
+        }
+        if (exp10 >= 0)
+            d = (double)mant * pow(10.0, (double)exp10);
+        else
+            d = (double)mant / pow(10.0, (double)-exp10);
+        if (!isfinite(d))
+            return REDIS_ERR;
+        *value = (s[0] == '-') ? -d : d;
+    }
+#endif
+    return REDIS_OK;
+}
+
 static char *readBytes(redisReader *r, unsigned int bytes) {
     char *p;
     if (r->len-r->pos >= bytes) {
@@ -297,7 +504,14 @@ static int processLineItem(redisReader *r) {
         if (cur->type == REDIS_REPLY_INTEGER) {
             long long v;
 
-            if (string2ll(p, len, &v) == REDIS_ERR) {
+            if (r->strict_numeric) {
+                if (strictParseDecimal(p, len, &v) == REDIS_ERR) {
+                    __redisReaderSetErrorAtOffset(r,
+                            "Strict numeric: bad integer value",
+                            r->consumed + (size_t)(p - r->buf));
+                    return REDIS_ERR;
+                }
+            } else if (string2ll(p, len, &v) == REDIS_ERR) {
                 __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
                         "Bad integer value");
                 return REDIS_ERR;
@@ -325,6 +539,22 @@ static int processLineItem(redisReader *r) {
             memcpy(buf,p,len);
             buf[len] = '\0';
 
+            if (r->strict_numeric) {
+                /* Strict, locale-independent parse; rejects trailing
+                 * garbage, hidden whitespace and non-canonical forms. */
+                if (strictParseDouble(p, len, &d) == REDIS_ERR) {
+                    __redisReaderSetErrorAtOffset(r,
+                            "Strict numeric: bad double value",
+                            r->consumed + (size_t)(p - r->buf));
+                    return REDIS_ERR;
+                }
+
+                if (r->fn && r->fn->createDouble) {
+                    obj = r->fn->createDouble(cur,d,buf,len);
+                } else {
+                    obj = (void*)REDIS_REPLY_DOUBLE;
+                }
+            } else {
 #ifndef HIREDIS_FLOAT_STRTOD
             if (len == 3 && strcasecmp(buf,"inf") == 0) {
                 d = INFINITY; /* Positive infinite. */
@@ -382,6 +612,7 @@ static int processLineItem(redisReader *r) {
                 obj = (void*)REDIS_REPLY_DOUBLE;
             }
 #endif
+            }
         } else if (cur->type == REDIS_REPLY_NIL) {
             if (len != 0) {
                 __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
@@ -466,7 +697,17 @@ static int processBulkItem(redisReader *r) {
         p = r->buf+r->pos;
         bytelen = s-(r->buf+r->pos)+2; /* include \r\n */
 
-        if (string2ll(p, bytelen - 2, &len) == REDIS_ERR) {
+        if (r->strict_numeric) {
+            /* Strict mode: the length must be a complete, canonical,
+             * non-overflowing decimal number. Overflow or junk is rejected
+             * here, before any allocation or range decision is made. */
+            if (strictParseDecimal(p, bytelen - 2, &len) == REDIS_ERR) {
+                __redisReaderSetErrorAtOffset(r,
+                        "Strict numeric: bad bulk string length",
+                        r->consumed + (size_t)(p - r->buf));
+                return REDIS_ERR;
+            }
+        } else if (string2ll(p, bytelen - 2, &len) == REDIS_ERR) {
             __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
                     "Bad bulk string length");
             return REDIS_ERR;
@@ -487,8 +728,23 @@ static int processBulkItem(redisReader *r) {
             success = 1;
         } else {
             /* Only continue when the buffer contains the entire bulk item. */
-            bytelen += len+2; /* include \r\n */
-            if (r->pos+bytelen <= r->len) {
+            int complete;
+            if (r->strict_numeric) {
+                /* Strict mode: compute the total item size with 64-bit,
+                 * overflow-safe arithmetic, so an extreme (but in-range)
+                 * length can never wrap the cursor math and trigger an
+                 * allocation. The allocation only happens once the whole
+                 * item is already buffered. */
+                unsigned long long need = (unsigned long long)bytelen +
+                                          (unsigned long long)len + 2ULL;
+                complete = (need <= (unsigned long long)(r->len - r->pos));
+                if (complete)
+                    bytelen = (unsigned long)need;
+            } else {
+                bytelen += len+2; /* include \r\n */
+                complete = (r->pos+bytelen <= r->len);
+            }
+            if (complete) {
                 if ((cur->type == REDIS_REPLY_VERB && len < 4) ||
                     (cur->type == REDIS_REPLY_VERB && s[5] != ':'))
                 {
@@ -569,7 +825,16 @@ static int processAggregateItem(redisReader *r) {
     }
 
     if ((p = readLine(r,&len)) != NULL) {
-        if (string2ll(p, len, &elements) == REDIS_ERR) {
+        if (r->strict_numeric) {
+            /* Strict mode: reject overflow/junk before the element count is
+             * used for any allocation (createArray) or range check. */
+            if (strictParseDecimal(p, len, &elements) == REDIS_ERR) {
+                __redisReaderSetErrorAtOffset(r,
+                        "Strict numeric: bad multi-bulk length",
+                        r->consumed + (size_t)(p - r->buf));
+                return REDIS_ERR;
+            }
+        } else if (string2ll(p, len, &elements) == REDIS_ERR) {
             __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
                     "Bad multi-bulk length");
             return REDIS_ERR;
@@ -786,8 +1051,13 @@ void redisReaderFree(redisReader *r) {
     hi_free(r);
 }
 
-int redisReaderFeed(redisReader *r, const char *buf, size_t len) {
-    sds newbuf;
+void redisReaderSetStrictNumeric(redisReader *r, int enabled) {
+    if (r == NULL)
+        return;
+    r->strict_numeric = (enabled != 0);
+}
+
+int redisReaderFeed(redisReader *r, const char *buf, size_t len) {    sds newbuf;
 
     /* Return early when this reader is in an erroneous state. */
     if (r->err)
@@ -851,9 +1121,11 @@ int redisReaderGetReply(redisReader *r, void **reply) {
         return REDIS_ERR;
 
     /* Discard part of the buffer when we've consumed at least 1k, to avoid
-     * doing unnecessary calls to memmove() in sds.c. */
+     * doing unnecessary calls to memmove() in sds.c. Account the discarded
+     * bytes so error offsets stay relative to the cumulative input stream. */
     if (r->pos >= 1024) {
         if (sdsrange(r->buf,r->pos,-1) < 0) return REDIS_ERR;
+        r->consumed += r->pos;
         r->pos = 0;
         r->len = sdslen(r->buf);
     }

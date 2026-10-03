@@ -115,6 +115,16 @@ typedef struct redisReader {
     void *privdata;
 
     int maxdepth; /* Max nested aggregate reply depth */
+
+    /* Optional strict numeric mode (disabled by default). When enabled,
+     * integer, double and length fields are validated against a strict,
+     * locale-independent grammar and protocol errors report the absolute
+     * byte offset in the cumulative input stream. See STRICT_NUMERIC.md. */
+    int strict_numeric;
+
+    /* Total number of input bytes consumed and discarded from the internal
+     * buffer so far. Used to report absolute stream offsets in errors. */
+    unsigned long long consumed;
 } redisReader;
 
 /* Public API for the protocol parser. */
@@ -122,6 +132,11 @@ redisReader *redisReaderCreateWithFunctions(redisReplyObjectFunctions *fn);
 void redisReaderFree(redisReader *r);
 int redisReaderFeed(redisReader *r, const char *buf, size_t len);
 int redisReaderGetReply(redisReader *r, void **reply);
+
+/* Enable (1) or disable (0) strict numeric parsing mode on a reader.
+ * The mode is off by default, leaving the classic parsing behavior
+ * untouched. See STRICT_NUMERIC.md for the exact grammar. */
+void redisReaderSetStrictNumeric(redisReader *r, int enabled);
 
 #define redisReaderSetPrivdata(_r, _p) (int)(((redisReader*)(_r))->privdata = (_p))
 #define redisReaderGetObject(_r) (((redisReader*)(_r))->reply)

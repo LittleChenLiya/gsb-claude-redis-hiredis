@@ -648,6 +648,21 @@ meaning unlimited with:
 context->reader->maxdepth = 0;
 ```
 
+### Reader strict numeric mode
+
+By default the parser keeps its classic numeric parsing behavior. An optional
+strict numeric mode validates integer, double and length fields against a
+strict, locale-independent grammar (complete canonical decimals only, no
+overflow, no whitespace or trailing garbage, explicit `inf`/`nan` literals
+only) and reports protocol errors with the absolute byte offset in the
+cumulative input stream:
+```c
+redisReaderSetStrictNumeric(context->reader, 1);
+```
+The mode is off by default. See [STRICT_NUMERIC.md](STRICT_NUMERIC.md) for the
+full grammar and configuration details, and `strict_numeric_demo.c` for a
+self-contained demo/test program.
+
 ## SSL/TLS Support
 
 ### Building
