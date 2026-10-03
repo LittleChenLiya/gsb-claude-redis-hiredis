@@ -648,6 +648,44 @@ meaning unlimited with:
 context->reader->maxdepth = 0;
 ```
 
+### Strict numeric mode
+
+Hiredis provides an optional strict numeric mode that applies stricter
+validation to integer, double and length fields when parsing RESP replies.
+This mode is disabled by default; the default protocol parsing is unchanged.
+
+To enable strict numeric mode, call `redisReaderSetStrictNumeric` on a reader
+immediately after creating it:
+```c
+redisReader *reader = redisReaderCreate();
+redisReaderSetStrictNumeric(reader, 1);
+```
+
+When strict numeric mode is enabled:
+
+- **Integers** must be a complete decimal number that does not overflow. The
+  parser does not use atoi-style partial acceptance; trailing characters and
+  leading zeros are rejected.
+- **Doubles** must be a finite decimal number or an explicit `inf`/`-inf`/
+  `nan` literal. Parsing is locale-independent (the decimal separator is
+  always `.`), and trailing garbage and hidden whitespace are rejected.
+- **Length fields** (bulk strings and aggregate replies) must be complete
+  decimal numbers that do not overflow. The overflow check happens before any
+  reply object is allocated, so an overflowed length can never trigger an
+  allocation.
+
+Malformed values are rejected with a protocol error whose message includes the
+cumulative input byte offset of the offending field. The offset is stable
+across chunked feeds: the same logical field reports the same offset no matter
+how the input was split.
+
+Strict numeric mode is useful when parsing untrusted input where protocol
+conformance is critical. It can be disabled at any time by calling
+`redisReaderSetStrictNumeric(reader, 0)`.
+
+A self-contained example that demonstrates strict numeric mode and prints parse
+results is available in `examples/example-strictnumeric.c`.
+
 ## SSL/TLS Support
 
 ### Building

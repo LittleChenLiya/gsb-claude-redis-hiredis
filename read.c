@@ -51,8 +51,15 @@
 /* RESP3 doubles are parsed with ffc (pure-C99 single header) by default: it is
  * several times faster than strtod() and locale-independent (strtod honours
  * LC_NUMERIC, which misparses the always-'.'-separated RESP3 doubles in a
- * non-'.' locale). Define HIREDIS_FLOAT_STRTOD to fall back to strtod(). */
+ * non-'.' locale). Define HIREDIS_FLOAT_STRTOD to fall back to strtod() for the
+ * default parsing path. The strict numeric path always uses ffc, so it stays
+ * locale-independent regardless of this define. */
 #define FFC_IMPL   /* emit ffc's implementation in this (sole) translation unit */
+#else
+/* Even when the default path uses strtod(), strict numeric mode needs the
+ * locale-independent ffc parser, so compile it in either way. */
+#define FFC_IMPL
+#endif
 /* ffc.h is a vendored third-party single header. Its public entry points are
  * `extern inline` and call file-local `static` helpers; that is well-defined for
  * our single-TU include but trips Clang's (default-on) -Wstatic-in-inline, which
@@ -65,7 +72,6 @@
 #include "ffc.h"
 #if defined(__clang__)
 #pragma clang diagnostic pop
-#endif
 #endif
 
 /* Initial size of our nested reply stack and how much we grow it when needd */
@@ -130,6 +136,94 @@ static void __redisReaderSetErrorProtocolByte(redisReader *r, char byte) {
 
 static void __redisReaderSetErrorOOM(redisReader *r) {
     __redisReaderSetError(r,REDIS_ERR_OOM,"Out of memory");
+}
+
+/* Cumulative byte offset of the start of the field currently being parsed.
+ * This is the number of bytes fed to the reader so far minus the bytes still
+ * buffered (both unread and partially consumed). It is stable across chunked
+ * feeds: the same logical field reports the same offset no matter how the
+ * input was split. Must be called before readLine() advances r->pos. */
+static size_t redisReaderFieldOffset(redisReader *r) {
+    return r->totalbytes - (r->len - r->pos);
+}
+
+/* Set a strict-mode protocol error. The message carries the cumulative input
+ * byte offset of the offending field so callers can locate it in the stream. */
+static void __redisReaderSetErrorStrict(redisReader *r, const char *kind,
+        size_t offset)
+{
+    char msg[160];
+
+    snprintf(msg,sizeof(msg),"%s at byte %zu",kind,offset);
+    __redisReaderSetError(r,REDIS_ERR_PROTOCOL,msg);
+}
+
+/* Validate the strict finite-double grammar:
+ *
+ *   [ '-' ] ( digits [ '.' [ digits ] ] | '.' digits ) [ ( 'e' | 'E' ) [ '-' ] digits ]
+ *
+ * with at least one digit overall and a full consume of the input. No leading
+ * '+' (matching the default ffc parser), no whitespace, no trailing junk, and
+ * no locale dependency (the decimal separator is always '.'). The explicit
+ * inf/nan tokens are handled separately by strictParseDouble(). */
+static int strictDoubleGrammar(const char *s, size_t len) {
+    const char *p = s;
+    const char *e = s + len;
+    int digits = 0;
+
+    if (p < e && *p == '-') p++;
+
+    while (p < e && *p >= '0' && *p <= '9') { p++; digits++; }
+
+    if (p < e && *p == '.') {
+        p++;
+        while (p < e && *p >= '0' && *p <= '9') { p++; digits++; }
+    }
+
+    if (digits == 0) return REDIS_ERR;
+
+    if (p < e && (*p == 'e' || *p == 'E')) {
+        p++;
+        if (p < e && *p == '-') p++;
+        int edigits = 0;
+        while (p < e && *p >= '0' && *p <= '9') { p++; edigits++; }
+        if (edigits == 0) return REDIS_ERR;
+    }
+
+    return (p == e) ? REDIS_OK : REDIS_ERR;
+}
+
+/* Strictly parse a RESP3 double. Only the explicit "inf"/"-inf"/"nan"/"-nan"
+ * tokens (case-insensitive, same as the default parser) or a finite decimal
+ * number are accepted. The finite path is grammar-checked and then parsed with
+ * ffc, which is locale-independent, so the result does not depend on the
+ * process LC_NUMERIC setting. Returns REDIS_OK and stores the value in *out on
+ * success, REDIS_ERR otherwise. */
+static int strictParseDouble(const char *s, size_t len, double *out) {
+    if (len == 3 && strcasecmp(s,"inf") == 0) {
+        *out = INFINITY;
+        return REDIS_OK;
+    }
+    if (len == 4 && strcasecmp(s,"-inf") == 0) {
+        *out = -INFINITY;
+        return REDIS_OK;
+    }
+    if ((len == 3 && strcasecmp(s,"nan") == 0) ||
+        (len == 4 && strcasecmp(s,"-nan") == 0))
+    {
+        *out = NAN;
+        return REDIS_OK;
+    }
+
+    if (strictDoubleGrammar(s,len) != REDIS_OK)
+        return REDIS_ERR;
+
+    ffc_parse_options o = ffc_parse_options_default();
+    o.format |= FFC_FORMAT_FLAG_NO_INFNAN;
+    ffc_result res = ffc_from_chars_double_options(s,s+len,out,o);
+    if (res.outcome != FFC_OUTCOME_OK || res.ptr != s+len || !isfinite(*out))
+        return REDIS_ERR;
+    return REDIS_OK;
 }
 
 static char *readBytes(redisReader *r, unsigned int bytes) {
@@ -292,14 +386,18 @@ static int processLineItem(redisReader *r) {
     void *obj;
     char *p;
     int len;
+    size_t off = redisReaderFieldOffset(r);
 
     if ((p = readLine(r,&len)) != NULL) {
         if (cur->type == REDIS_REPLY_INTEGER) {
             long long v;
 
             if (string2ll(p, len, &v) == REDIS_ERR) {
-                __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
-                        "Bad integer value");
+                if (r->strict_numeric)
+                    __redisReaderSetErrorStrict(r,"Bad integer value",off);
+                else
+                    __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                            "Bad integer value");
                 return REDIS_ERR;
             }
 
@@ -313,8 +411,11 @@ static int processLineItem(redisReader *r) {
             double d;
 
             if ((size_t)len >= sizeof(buf)) {
-                __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
-                        "Double value is too large");
+                if (r->strict_numeric)
+                    __redisReaderSetErrorStrict(r,"Double value is too large",off);
+                else
+                    __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                            "Double value is too large");
                 return REDIS_ERR;
             }
 
@@ -325,55 +426,61 @@ static int processLineItem(redisReader *r) {
             memcpy(buf,p,len);
             buf[len] = '\0';
 
+            if (r->strict_numeric) {
+                /* Strict mode: only the explicit inf/nan tokens or a finite
+                 * decimal number are accepted, grammar-checked and parsed with
+                 * the locale-independent ffc. The result does not depend on
+                 * the process LC_NUMERIC setting. */
+                if (strictParseDouble(buf,len,&d) != REDIS_OK) {
+                    __redisReaderSetErrorStrict(r,"Bad double value",off);
+                    return REDIS_ERR;
+                }
+            } else {
 #ifndef HIREDIS_FLOAT_STRTOD
-            if (len == 3 && strcasecmp(buf,"inf") == 0) {
-                d = INFINITY; /* Positive infinite. */
-            } else if (len == 4 && strcasecmp(buf,"-inf") == 0) {
-                d = -INFINITY; /* Negative infinite. */
-            } else if ((len == 3 && strcasecmp(buf,"nan") == 0) ||
-                       (len == 4 && strcasecmp(buf, "-nan") == 0)) {
-                d = NAN; /* nan. */
-            } else {
-                /* RESP3 allows only finite values besides the inf/nan tokens
-                 * handled above, so run ffc with NO_INFNAN; the full-consume +
-                 * isfinite checks then mirror the strtod path's eptr/isfinite. */
-                ffc_parse_options o = ffc_parse_options_default();
-                o.format |= FFC_FORMAT_FLAG_NO_INFNAN;
-                ffc_result res = ffc_from_chars_double_options(buf, buf + len, &d, o);
-                if (res.outcome != FFC_OUTCOME_OK || res.ptr != buf + len ||
-                    !isfinite(d)) {
-                    __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
-                            "Bad double value");
-                    return REDIS_ERR;
+                if (len == 3 && strcasecmp(buf,"inf") == 0) {
+                    d = INFINITY; /* Positive infinite. */
+                } else if (len == 4 && strcasecmp(buf,"-inf") == 0) {
+                    d = -INFINITY; /* Negative infinite. */
+                } else if ((len == 3 && strcasecmp(buf,"nan") == 0) ||
+                           (len == 4 && strcasecmp(buf, "-nan") == 0)) {
+                    d = NAN; /* nan. */
+                } else {
+                    /* RESP3 allows only finite values besides the inf/nan tokens
+                     * handled above, so run ffc with NO_INFNAN; the full-consume +
+                     * isfinite checks then mirror the strtod path's eptr/isfinite. */
+                    ffc_parse_options o = ffc_parse_options_default();
+                    o.format |= FFC_FORMAT_FLAG_NO_INFNAN;
+                    ffc_result res = ffc_from_chars_double_options(buf, buf + len, &d, o);
+                    if (res.outcome != FFC_OUTCOME_OK || res.ptr != buf + len ||
+                        !isfinite(d)) {
+                        __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                                "Bad double value");
+                        return REDIS_ERR;
+                    }
                 }
-            }
-
-            if (r->fn && r->fn->createDouble) {
-                obj = r->fn->createDouble(cur,d,buf,len);
-            } else {
-                obj = (void*)REDIS_REPLY_DOUBLE;
-            }
 #else
-            char *eptr;
+                char *eptr;
 
-            if (len == 3 && strcasecmp(buf,"inf") == 0) {
-                d = INFINITY; /* Positive infinite. */
-            } else if (len == 4 && strcasecmp(buf,"-inf") == 0) {
-                d = -INFINITY; /* Negative infinite. */
-            } else if ((len == 3 && strcasecmp(buf,"nan") == 0) ||
-                       (len == 4 && strcasecmp(buf, "-nan") == 0)) {
-                d = NAN; /* nan. */
-            } else {
-                d = strtod((char*)buf,&eptr);
-                /* RESP3 only allows "inf", "-inf", and finite values, while
-                 * strtod() allows other variations on infinity,
-                 * etc. We explicity handle our two allowed infinite cases and NaN
-                 * above, so strtod() should only result in finite values. */
-                if (buf[0] == '\0' || eptr != &buf[len] || !isfinite(d)) {
-                    __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
-                            "Bad double value");
-                    return REDIS_ERR;
+                if (len == 3 && strcasecmp(buf,"inf") == 0) {
+                    d = INFINITY; /* Positive infinite. */
+                } else if (len == 4 && strcasecmp(buf,"-inf") == 0) {
+                    d = -INFINITY; /* Negative infinite. */
+                } else if ((len == 3 && strcasecmp(buf,"nan") == 0) ||
+                           (len == 4 && strcasecmp(buf, "-nan") == 0)) {
+                    d = NAN; /* nan. */
+                } else {
+                    d = strtod((char*)buf,&eptr);
+                    /* RESP3 only allows "inf", "-inf", and finite values, while
+                     * strtod() allows other variations on infinity,
+                     * etc. We explicity handle our two allowed infinite cases and NaN
+                     * above, so strtod() should only result in finite values. */
+                    if (buf[0] == '\0' || eptr != &buf[len] || !isfinite(d)) {
+                        __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                                "Bad double value");
+                        return REDIS_ERR;
+                    }
                 }
+#endif
             }
 
             if (r->fn && r->fn->createDouble) {
@@ -381,7 +488,6 @@ static int processLineItem(redisReader *r) {
             } else {
                 obj = (void*)REDIS_REPLY_DOUBLE;
             }
-#endif
         } else if (cur->type == REDIS_REPLY_NIL) {
             if (len != 0) {
                 __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
@@ -458,7 +564,9 @@ static int processBulkItem(redisReader *r) {
     char *p, *s;
     long long len;
     unsigned long bytelen;
+    size_t strict_total = 0;
     int success = 0;
+    size_t off = redisReaderFieldOffset(r);
 
     p = r->buf+r->pos;
     s = seekNewline(p,r->len-r->pos);
@@ -467,28 +575,44 @@ static int processBulkItem(redisReader *r) {
         bytelen = s-(r->buf+r->pos)+2; /* include \r\n */
 
         if (string2ll(p, bytelen - 2, &len) == REDIS_ERR) {
-            __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
-                    "Bad bulk string length");
-            return REDIS_ERR;
-        }
-
-        if (len < -1 || (LLONG_MAX > SIZE_MAX && len > (long long)SIZE_MAX)) {
-            __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
-                    "Bulk string length out of range");
-            return REDIS_ERR;
-        }
-
-        if (len == -1) {
-            /* The nil object can always be created. */
-            if (r->fn && r->fn->createNil)
-                obj = r->fn->createNil(cur);
+            if (r->strict_numeric)
+                __redisReaderSetErrorStrict(r,"Bad bulk string length",off);
             else
-                obj = (void*)REDIS_REPLY_NIL;
-            success = 1;
-        } else {
-            /* Only continue when the buffer contains the entire bulk item. */
-            bytelen += len+2; /* include \r\n */
-            if (r->pos+bytelen <= r->len) {
+                __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                        "Bad bulk string length");
+            return REDIS_ERR;
+        }
+
+        if (r->strict_numeric) {
+            /* Strict: the length must be a complete decimal that does not
+             * overflow, and the entire bulk must fit in the buffer. The
+             * size_t arithmetic is checked before any allocation is
+             * attempted, so an overflowed length can never reach
+             * createString(). */
+            if (len < -1) {
+                __redisReaderSetErrorStrict(r,"Bulk string length out of range",off);
+                return REDIS_ERR;
+            }
+            if (len == -1) {
+                /* The nil object can always be created. */
+                if (r->fn && r->fn->createNil)
+                    obj = r->fn->createNil(cur);
+                else
+                    obj = (void*)REDIS_REPLY_NIL;
+                strict_total = bytelen;
+                success = 1;
+            } else {
+                size_t content = (size_t)len;
+                /* Total bytes the bulk occupies: the length line (bytelen,
+                 * including its \r\n) + the content + the trailing \r\n. */
+                size_t total = (size_t)bytelen + content + 2;
+                if (total < content || r->pos > SIZE_MAX - total) {
+                    __redisReaderSetErrorStrict(r,"Bulk string length out of range",off);
+                    return REDIS_ERR;
+                }
+                if (r->pos + total > r->len)
+                    return REDIS_ERR; /* incomplete: need more data */
+                strict_total = total;
                 if ((cur->type == REDIS_REPLY_VERB && len < 4) ||
                     (cur->type == REDIS_REPLY_VERB && s[5] != ':'))
                 {
@@ -503,6 +627,39 @@ static int processBulkItem(redisReader *r) {
                     obj = (void*)(uintptr_t)cur->type;
                 success = 1;
             }
+        } else {
+            if (len < -1 || (LLONG_MAX > SIZE_MAX && len > (long long)SIZE_MAX)) {
+                __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                        "Bulk string length out of range");
+                return REDIS_ERR;
+            }
+
+            if (len == -1) {
+                /* The nil object can always be created. */
+                if (r->fn && r->fn->createNil)
+                    obj = r->fn->createNil(cur);
+                else
+                    obj = (void*)REDIS_REPLY_NIL;
+                success = 1;
+            } else {
+                /* Only continue when the buffer contains the entire bulk item. */
+                bytelen += len+2; /* include \r\n */
+                if (r->pos+bytelen <= r->len) {
+                    if ((cur->type == REDIS_REPLY_VERB && len < 4) ||
+                        (cur->type == REDIS_REPLY_VERB && s[5] != ':'))
+                    {
+                        __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                                "Verbatim string 4 bytes of content type are "
+                                "missing or incorrectly encoded.");
+                        return REDIS_ERR;
+                    }
+                    if (r->fn && r->fn->createString)
+                        obj = r->fn->createString(cur,s+2,len);
+                    else
+                        obj = (void*)(uintptr_t)cur->type;
+                    success = 1;
+                }
+            }
         }
 
         /* Proceed when obj was created. */
@@ -512,7 +669,10 @@ static int processBulkItem(redisReader *r) {
                 return REDIS_ERR;
             }
 
-            r->pos += bytelen;
+            if (r->strict_numeric)
+                r->pos += strict_total;
+            else
+                r->pos += bytelen;
 
             /* Set reply if this is the root object. */
             if (r->ridx == 0) r->reply = obj;
@@ -556,6 +716,7 @@ static int processAggregateItem(redisReader *r) {
     char *p;
     long long elements;
     int root = 0, len;
+    size_t off = redisReaderFieldOffset(r);
 
     if (r->maxdepth > 0 && r->ridx >= r->maxdepth) {
         __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
@@ -570,8 +731,11 @@ static int processAggregateItem(redisReader *r) {
 
     if ((p = readLine(r,&len)) != NULL) {
         if (string2ll(p, len, &elements) == REDIS_ERR) {
-            __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
-                    "Bad multi-bulk length");
+            if (r->strict_numeric)
+                __redisReaderSetErrorStrict(r,"Bad multi-bulk length",off);
+            else
+                __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                        "Bad multi-bulk length");
             return REDIS_ERR;
         }
 
@@ -580,8 +744,11 @@ static int processAggregateItem(redisReader *r) {
         if (elements < -1 || (LLONG_MAX > SIZE_MAX && elements > SIZE_MAX) ||
             (r->maxelements > 0 && elements > r->maxelements))
         {
-            __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
-                    "Multi-bulk length out of range");
+            if (r->strict_numeric)
+                __redisReaderSetErrorStrict(r,"Multi-bulk length out of range",off);
+            else
+                __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                        "Multi-bulk length out of range");
             return REDIS_ERR;
         }
 
@@ -606,16 +773,30 @@ static int processAggregateItem(redisReader *r) {
                 }
 
                 if (elements > maxelements) {
-                    __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
-                            "Multi-bulk length out of range");
+                    if (r->strict_numeric)
+                        __redisReaderSetErrorStrict(r,"Multi-bulk length out of range",off);
+                    else
+                        __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                                "Multi-bulk length out of range");
                     return REDIS_ERR;
                 }
 
                 elements *= 2;
             }
 
+            /* Strict: block the createArray() allocation before it is
+             * attempted when the element count would overflow size_t. The
+             * default path relies on calloc() failing, which may surface as
+             * OOM; strict mode reports a protocol error instead. */
+            if (r->strict_numeric &&
+                elements > (long long)(SIZE_MAX / sizeof(void*)))
+            {
+                __redisReaderSetErrorStrict(r,"Multi-bulk length out of range",off);
+                return REDIS_ERR;
+            }
+
             if (r->fn && r->fn->createArray)
-                obj = r->fn->createArray(cur,elements);
+                obj = r->fn->createArray(cur,(size_t)elements);
             else
                 obj = (void*)(uintptr_t)cur->type;
 
@@ -759,6 +940,8 @@ redisReader *redisReaderCreateWithFunctions(redisReplyObjectFunctions *fn) {
     r->maxelements = REDIS_READER_MAX_ARRAY_ELEMENTS;
     r->maxdepth = REDIS_READER_MAX_REPLY_DEPTH;
     r->ridx = -1;
+    r->strict_numeric = 0;
+    r->totalbytes = 0;
 
     return r;
 oom:
@@ -786,6 +969,10 @@ void redisReaderFree(redisReader *r) {
     hi_free(r);
 }
 
+void redisReaderSetStrictNumeric(redisReader *r, int strict) {
+    r->strict_numeric = strict ? 1 : 0;
+}
+
 int redisReaderFeed(redisReader *r, const char *buf, size_t len) {
     sds newbuf;
 
@@ -809,6 +996,7 @@ int redisReaderFeed(redisReader *r, const char *buf, size_t len) {
 
         r->buf = newbuf;
         r->len = sdslen(r->buf);
+        r->totalbytes += len;
     }
 
     return REDIS_OK;

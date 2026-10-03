@@ -6,12 +6,17 @@
 #ifndef _WIN32
 #include <strings.h>
 #include <sys/time.h>
+#elif defined(__MINGW32__)
+/* usleep is used by millisleep(); a forward declaration avoids pulling in
+ * <unistd.h>, which conflicts with sockcompat.h's close() macro. */
+extern int usleep(unsigned int);
 #endif
 #include <assert.h>
 #include <signal.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <locale.h>
 
 #ifdef __linux__
 #include <arpa/inet.h>
@@ -961,6 +966,258 @@ static void test_reply_reader(void) {
         ((redisReply*)reply)->element[0]->len == 22 &&
         strcmp(((redisReply*)reply)->element[0]->str, "3.14159265358979323846") == 0);
     freeReplyObject(reply);
+    redisReaderFree(reader);
+}
+
+/* Counting allocator fixture: records the largest single allocation request
+ * so tests can verify that strict mode blocks overflowed lengths before any
+ * allocation is attempted. */
+static size_t strict_alloc_max;
+static void *strict_counting_malloc(size_t size) {
+    if (size > strict_alloc_max) strict_alloc_max = size;
+    return malloc(size);
+}
+static void *strict_counting_calloc(size_t nmemb, size_t size) {
+    if (nmemb != 0 && size > SIZE_MAX / nmemb) return NULL;
+    size_t total = nmemb * size;
+    if (total > strict_alloc_max) strict_alloc_max = total;
+    return calloc(nmemb, size);
+}
+static void *strict_counting_realloc(void *ptr, size_t size) {
+    if (size > strict_alloc_max) strict_alloc_max = size;
+    return realloc(ptr, size);
+}
+static char *strict_counting_strdup(const char *s) {
+    size_t len = strlen(s) + 1;
+    if (len > strict_alloc_max) strict_alloc_max = len;
+    return strdup(s);
+}
+
+static void test_strict_numeric(void) {
+    redisReader *reader;
+    void *reply;
+    int ret;
+
+    /* --- Integer tests --- */
+
+    test("Strict mode rejects chunked 12x integer: ");
+    reader = redisReaderCreate();
+    redisReaderSetStrictNumeric(reader, 1);
+    redisReaderFeed(reader, ":12", 3);
+    ret = redisReaderGetReply(reader, &reply);
+    assert(ret == REDIS_OK && reply == NULL); /* incomplete, need more data */
+    redisReaderFeed(reader, "x\r\n", 3);
+    ret = redisReaderGetReply(reader, &reply);
+    test_cond(ret == REDIS_ERR && reader->err == REDIS_ERR_PROTOCOL &&
+              strstr(reader->errstr, "Bad integer value") != NULL &&
+              strstr(reader->errstr, "at byte 1") != NULL);
+    redisReaderFree(reader);
+
+    test("Strict mode accepts valid negative integers: ");
+    {
+        static const char *cases[] = {
+            ":-1\r\n", ":-9223372036854775808\r\n", ":0\r\n", ":42\r\n"
+        };
+        static const long long vals[] = { -1, LLONG_MIN, 0, 42 };
+        int ok = 1;
+        for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+            reader = redisReaderCreate();
+            redisReaderSetStrictNumeric(reader, 1);
+            redisReaderFeed(reader, cases[i], strlen(cases[i]));
+            ret = redisReaderGetReply(reader, &reply);
+            if (ret != REDIS_OK || reply == NULL ||
+                ((redisReply*)reply)->type != REDIS_REPLY_INTEGER ||
+                ((redisReply*)reply)->integer != vals[i]) ok = 0;
+            freeReplyObject(reply);
+            redisReaderFree(reader);
+        }
+        test_cond(ok);
+    }
+
+    test("Strict mode rejects integer with trailing junk (whole feed): ");
+    reader = redisReaderCreate();
+    redisReaderSetStrictNumeric(reader, 1);
+    redisReaderFeed(reader, ":12x\r\n", 6);
+    ret = redisReaderGetReply(reader, &reply);
+    test_cond(ret == REDIS_ERR && reader->err == REDIS_ERR_PROTOCOL &&
+              strstr(reader->errstr, "at byte 1") != NULL);
+    redisReaderFree(reader);
+
+    /* --- Double tests --- */
+
+    test("Strict mode parses double 1.5 under a changed locale: ");
+    {
+        static const char *locales[] = {
+            "de_DE.UTF-8", "de_DE.utf8", "de-DE", "German_Germany.1252",
+            "fr_FR.UTF-8", "fr-FR", NULL
+        };
+        int ok = 0;
+        for (size_t i = 0; locales[i]; i++) {
+            if (setlocale(LC_NUMERIC, locales[i]) == NULL) continue;
+            reader = redisReaderCreate();
+            redisReaderSetStrictNumeric(reader, 1);
+            redisReaderFeed(reader, ",1.5\r\n", 6);
+            ret = redisReaderGetReply(reader, &reply);
+            if (ret == REDIS_OK && reply != NULL &&
+                ((redisReply*)reply)->type == REDIS_REPLY_DOUBLE &&
+                ((redisReply*)reply)->dval == 1.5) ok = 1;
+            freeReplyObject(reply);
+            redisReaderFree(reader);
+            setlocale(LC_NUMERIC, "C");
+            if (ok) break;
+        }
+        test_cond(ok);
+    }
+
+    test("Strict mode rejects double with trailing junk: ");
+    reader = redisReaderCreate();
+    redisReaderSetStrictNumeric(reader, 1);
+    redisReaderFeed(reader, ",1.5x\r\n", 7);
+    ret = redisReaderGetReply(reader, &reply);
+    test_cond(ret == REDIS_ERR && reader->err == REDIS_ERR_PROTOCOL &&
+              strstr(reader->errstr, "Bad double value") != NULL);
+    redisReaderFree(reader);
+
+    test("Strict mode rejects double with hidden whitespace: ");
+    reader = redisReaderCreate();
+    redisReaderSetStrictNumeric(reader, 1);
+    redisReaderFeed(reader, ", 1.5\r\n", 7);
+    ret = redisReaderGetReply(reader, &reply);
+    test_cond(ret == REDIS_ERR && reader->err == REDIS_ERR_PROTOCOL);
+    redisReaderFree(reader);
+
+    test("Strict mode accepts inf/nan doubles: ");
+    {
+        static const char *cases[] = {
+            ",inf\r\n", ",-inf\r\n", ",nan\r\n", ",-nan\r\n", ",INF\r\n", ",NaN\r\n"
+        };
+        int ok = 1;
+        for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+            reader = redisReaderCreate();
+            redisReaderSetStrictNumeric(reader, 1);
+            redisReaderFeed(reader, cases[i], strlen(cases[i]));
+            ret = redisReaderGetReply(reader, &reply);
+            if (ret != REDIS_OK || reply == NULL ||
+                ((redisReply*)reply)->type != REDIS_REPLY_DOUBLE) ok = 0;
+            freeReplyObject(reply);
+            redisReaderFree(reader);
+        }
+        test_cond(ok);
+    }
+
+    /* --- Length tests --- */
+
+    test("Strict mode accepts null bulk and null multi-bulk: ");
+    {
+        static const char *cases[] = { "$-1\r\n", "*-1\r\n", "%-1\r\n" };
+        int ok = 1;
+        for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+            reader = redisReaderCreate();
+            redisReaderSetStrictNumeric(reader, 1);
+            redisReaderFeed(reader, cases[i], strlen(cases[i]));
+            ret = redisReaderGetReply(reader, &reply);
+            if (ret != REDIS_OK || reply == NULL ||
+                ((redisReply*)reply)->type != REDIS_REPLY_NIL) ok = 0;
+            freeReplyObject(reply);
+            redisReaderFree(reader);
+        }
+        test_cond(ok);
+    }
+
+    test("Strict mode blocks multi-bulk length overflow before allocation: ");
+    {
+        size_t bad_len = (SIZE_MAX / sizeof(void *)) + 3;
+        char bad_reply[100];
+        hiredisAllocFuncs saved, fns = {
+            strict_counting_malloc, strict_counting_calloc,
+            strict_counting_realloc, strict_counting_strdup, free
+        };
+        snprintf(bad_reply, sizeof(bad_reply), "*%llu\r\n",
+                 (unsigned long long)bad_len);
+
+        saved = hiredisSetAllocators(&fns);
+        strict_alloc_max = 0;
+        reader = redisReaderCreate();
+        reader->maxelements = 0;
+        redisReaderSetStrictNumeric(reader, 1);
+        redisReaderFeed(reader, bad_reply, strlen(bad_reply));
+        ret = redisReaderGetReply(reader, &reply);
+        test_cond(ret == REDIS_ERR && reader->err == REDIS_ERR_PROTOCOL &&
+                  strict_alloc_max < 1000);
+        redisReaderFree(reader);
+        hiredisSetAllocators(&saved);
+    }
+
+    test("Strict mode rejects bulk string length overflow: ");
+    {
+        char bad_reply[100];
+        hiredisAllocFuncs saved, fns = {
+            strict_counting_malloc, strict_counting_calloc,
+            strict_counting_realloc, strict_counting_strdup, free
+        };
+        snprintf(bad_reply, sizeof(bad_reply), "$%llu\r\n",
+                 (unsigned long long)SIZE_MAX);
+
+        saved = hiredisSetAllocators(&fns);
+        strict_alloc_max = 0;
+        reader = redisReaderCreate();
+        redisReaderSetStrictNumeric(reader, 1);
+        redisReaderFeed(reader, bad_reply, strlen(bad_reply));
+        ret = redisReaderGetReply(reader, &reply);
+        test_cond(ret == REDIS_ERR && reader->err == REDIS_ERR_PROTOCOL &&
+                  strict_alloc_max < 1000);
+        redisReaderFree(reader);
+        hiredisSetAllocators(&saved);
+    }
+
+    /* --- Boundary chunking tests --- */
+
+    test("Strict mode parses a reply fed one byte at a time: ");
+    {
+        static const char *reply_str = "*2\r\n$5\r\nhello\r\n:42\r\n";
+        size_t len = strlen(reply_str);
+        int ok = 1;
+        reader = redisReaderCreate();
+        redisReaderSetStrictNumeric(reader, 1);
+        for (size_t i = 0; i < len; i++) {
+            redisReaderFeed(reader, &reply_str[i], 1);
+            ret = redisReaderGetReply(reader, &reply);
+            if (ret == REDIS_ERR) { ok = 0; break; }
+            if (reply != NULL && i + 1 < len) { ok = 0; break; }
+        }
+        if (ok && (ret != REDIS_OK || reply == NULL ||
+                   ((redisReply*)reply)->type != REDIS_REPLY_ARRAY ||
+                   ((redisReply*)reply)->elements != 2)) ok = 0;
+        freeReplyObject(reply);
+        redisReaderFree(reader);
+        test_cond(ok);
+    }
+
+    test("Strict mode reports error position across chunked feeds: ");
+    {
+        /* Feed a valid reply first, then a bad integer; the position is
+         * relative to the start of the stream. */
+        reader = redisReaderCreate();
+        redisReaderSetStrictNumeric(reader, 1);
+        redisReaderFeed(reader, "+OK\r\n", 5);
+        ret = redisReaderGetReply(reader, &reply);
+        assert(ret == REDIS_OK);
+        freeReplyObject(reply);
+        redisReaderFeed(reader, ":12x\r\n", 6);
+        ret = redisReaderGetReply(reader, &reply);
+        test_cond(ret == REDIS_ERR && reader->err == REDIS_ERR_PROTOCOL &&
+                  strstr(reader->errstr, "at byte 6") != NULL);
+        redisReaderFree(reader);
+    }
+
+    /* --- Default mode unchanged --- */
+
+    test("Default mode still rejects bad integers (unchanged): ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader, ":12x\r\n", 6);
+    ret = redisReaderGetReply(reader, &reply);
+    test_cond(ret == REDIS_ERR && reader->err == REDIS_ERR_PROTOCOL &&
+              strcmp(reader->errstr, "Bad integer value") == 0);
     redisReaderFree(reader);
 }
 
@@ -2745,6 +3002,7 @@ int main(int argc, char **argv) {
 
     test_format_commands();
     test_reply_reader();
+    test_strict_numeric();
     test_blocking_connection_errors();
     test_free_null();
 #ifdef __linux__

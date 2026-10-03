@@ -115,6 +115,9 @@ typedef struct redisReader {
     void *privdata;
 
     int maxdepth; /* Max nested aggregate reply depth */
+
+    int strict_numeric; /* Non-zero to enable strict numeric parsing */
+    size_t totalbytes; /* Cumulative number of bytes ever fed to the reader */
 } redisReader;
 
 /* Public API for the protocol parser. */
@@ -122,6 +125,23 @@ redisReader *redisReaderCreateWithFunctions(redisReplyObjectFunctions *fn);
 void redisReaderFree(redisReader *r);
 int redisReaderFeed(redisReader *r, const char *buf, size_t len);
 int redisReaderGetReply(redisReader *r, void **reply);
+
+/* Enable or disable strict numeric parsing. When enabled, the reader applies
+ * stricter validation to integer, double and length fields:
+ *
+ *  - Integers must be a complete decimal number that does not overflow
+ *    (no partial atoi-style acceptance, no trailing characters).
+ *  - Doubles must be a finite decimal number or an explicit "inf"/"-inf"/
+ *    "nan" literal; parsing is locale-independent and rejects trailing
+ *    garbage and hidden whitespace.
+ *  - Length fields (bulk strings and aggregate replies) must be complete
+ *    decimal numbers that do not overflow, and the overflow check happens
+ *    before any reply object is allocated.
+ *
+ * Malformed values are rejected with a protocol error whose message includes
+ * the cumulative input byte offset of the offending field. The default
+ * protocol parsing is unchanged when this mode is disabled. */
+void redisReaderSetStrictNumeric(redisReader *r, int strict);
 
 #define redisReaderSetPrivdata(_r, _p) (int)(((redisReader*)(_r))->privdata = (_p))
 #define redisReaderGetObject(_r) (((redisReader*)(_r))->reply)
