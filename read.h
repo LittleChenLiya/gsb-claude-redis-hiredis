@@ -85,6 +85,30 @@ typedef struct redisReadTask {
     void *privdata; /* user-settable arbitrary field */
 } redisReadTask;
 
+/* Source range of a parsed top-level reply.
+ *
+ * When source reporting is enabled (see redisReaderSetSourceReport()), the
+ * reader records the byte range that each completed top-level reply consumed
+ * from the cumulative input stream. This is useful for debugging chunked
+ * RESP: it maps a reply back to the exact bytes that produced it, no matter
+ * how those bytes were split across redisReaderFeed() calls.
+ *
+ * The offsets are cumulative: they count every byte fed to the reader since
+ * it was created (or last reset with redisReaderReset()), regardless of how
+ * the bytes were split across feeds. The range is half-open: [start, end).
+ *
+ * Nested replies are not reported separately; only the outermost top-level
+ * reply gets a single range covering the whole aggregate. A RESP3 push reply
+ * is itself a top-level reply and gets its own range. A partial reply never
+ * reports a range early. When a protocol error occurs, the range describes
+ * the bytes consumed for the failed reply and `type` is set to 0.
+ */
+typedef struct redisReplySource {
+    size_t start; /* Cumulative feed offset of the first reply byte. */
+    size_t end;   /* Cumulative feed offset one past the last reply byte. */
+    int type;     /* Reply type (REDIS_REPLY_*), or 0 for an error range. */
+} redisReplySource;
+
 typedef struct redisReplyObjectFunctions {
     void *(*createString)(const redisReadTask*, char*, size_t);
     void *(*createArray)(const redisReadTask*, size_t);
@@ -115,6 +139,17 @@ typedef struct redisReader {
     void *privdata;
 
     int maxdepth; /* Max nested aggregate reply depth */
+
+    /* Optional source reporting. Off by default; does not change the reply
+     * object structure. */
+    int source_report;          /* Non-zero to record reply source ranges. */
+    redisReplySource source;    /* Source of the last completed top-level
+                                   reply (or protocol error). */
+    int source_valid;           /* Non-zero when `source` holds a valid
+                                   range. */
+    size_t buf_abs;             /* Cumulative feed offset of buf[0]. */
+    size_t reply_start;         /* Cumulative feed offset where the current
+                                   top-level reply starts. */
 } redisReader;
 
 /* Public API for the protocol parser. */
@@ -122,6 +157,23 @@ redisReader *redisReaderCreateWithFunctions(redisReplyObjectFunctions *fn);
 void redisReaderFree(redisReader *r);
 int redisReaderFeed(redisReader *r, const char *buf, size_t len);
 int redisReaderGetReply(redisReader *r, void **reply);
+
+/* Enable or disable source reporting for the reader. When enabled, the
+ * reader records the cumulative byte range of every completed top-level reply
+ * (and of protocol errors). Disabled by default. The reply object structure
+ * is never changed. Returns REDIS_OK. */
+int redisReaderSetSourceReport(redisReader *r, int on);
+
+/* Retrieve the source range of the reply returned by the most recent
+ * redisReaderGetReply() call. Returns REDIS_OK and fills `src` when a source
+ * is available, REDIS_ERR otherwise (reporting disabled, no reply has
+ * completed yet, or the last call only produced a partial reply). */
+int redisReaderGetReplySource(redisReader *r, redisReplySource *src);
+
+/* Reset the reader to a freshly-created state: any pending reply, buffered
+ * bytes and error are discarded, and the cumulative feed offset restarts at
+ * 0 (a new session). Source reporting configuration is preserved. */
+void redisReaderReset(redisReader *r);
 
 #define redisReaderSetPrivdata(_r, _p) (int)(((redisReader*)(_r))->privdata = (_p))
 #define redisReaderGetObject(_r) (((redisReader*)(_r))->reply)

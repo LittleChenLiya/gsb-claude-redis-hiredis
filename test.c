@@ -962,6 +962,163 @@ static void test_reply_reader(void) {
         strcmp(((redisReply*)reply)->element[0]->str, "3.14159265358979323846") == 0);
     freeReplyObject(reply);
     redisReaderFree(reader);
+
+    /* Optional reply source reporting. Off by default and never changes the
+     * reply object structure. The ranges are cumulative feed offsets. */
+    test("Source reporting is off by default: ");
+    reader = redisReaderCreate();
+    redisReaderFeed(reader,"+OK\r\n",5);
+    ret = redisReaderGetReply(reader,&reply);
+    test_cond(ret == REDIS_OK && reply != NULL &&
+              redisReaderGetReplySource(reader,&(redisReplySource){0}) == REDIS_ERR);
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Source reporting: two replies across 3 feeds: ");
+    reader = redisReaderCreate();
+    redisReaderSetSourceReport(reader,1);
+    redisReaderFeed(reader,"+OK\r",4);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply == NULL); /* partial: no report yet */
+    redisReaderFeed(reader,"\n:42\r\n",6);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL);
+    {
+        redisReplySource s1, s2;
+        int r1 = redisReaderGetReplySource(reader,&s1);
+        ret = redisReaderGetReply(reader,&reply);
+        assert(ret == REDIS_OK && reply != NULL);
+        int r2 = redisReaderGetReplySource(reader,&s2);
+        test_cond(r1 == REDIS_OK && r2 == REDIS_OK &&
+                  s1.start == 0 && s1.end == 5 && s1.type == REDIS_REPLY_STATUS &&
+                  s2.start == 5 && s2.end == 10 && s2.type == REDIS_REPLY_INTEGER);
+    }
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Source reporting: nested array has one top-level range: ");
+    reader = redisReaderCreate();
+    redisReaderSetSourceReport(reader,1);
+    redisReaderFeed(reader,"*2\r\n$5\r\nhello\r\n:7\r\n",19);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL);
+    {
+        redisReplySource s;
+        ret = redisReaderGetReplySource(reader,&s);
+        test_cond(ret == REDIS_OK &&
+                  s.start == 0 && s.end == 19 && s.type == REDIS_REPLY_ARRAY);
+    }
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Source reporting: push is a separate top-level report: ");
+    reader = redisReaderCreate();
+    redisReaderSetSourceReport(reader,1);
+    redisReaderFeed(reader,">2\r\n$6\r\nLOLWUT\r\n:42\r\n",21);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL);
+    {
+        redisReplySource s;
+        ret = redisReaderGetReplySource(reader,&s);
+        test_cond(ret == REDIS_OK &&
+                  s.start == 0 && s.end == 21 && s.type == REDIS_REPLY_PUSH);
+    }
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Source reporting: binary bulk newlines are content: ");
+    reader = redisReaderCreate();
+    redisReaderSetSourceReport(reader,1);
+    /* content is 8 bytes: a \n b \r \n c \r \n */
+    redisReaderFeed(reader,"$8\r\na\nb\r\nc\r\n\r\n",14);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL);
+    {
+        redisReplySource s;
+        ret = redisReaderGetReplySource(reader,&s);
+        test_cond(ret == REDIS_OK &&
+                  s.start == 0 && s.end == 14 && s.type == REDIS_REPLY_STRING);
+    }
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Source reporting: empty bulk: ");
+    reader = redisReaderCreate();
+    redisReaderSetSourceReport(reader,1);
+    redisReaderFeed(reader,"$0\r\n\r\n",6);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL);
+    {
+        redisReplySource s;
+        ret = redisReaderGetReplySource(reader,&s);
+        test_cond(ret == REDIS_OK &&
+                  s.start == 0 && s.end == 6 && s.type == REDIS_REPLY_STRING);
+    }
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Source reporting: protocol error gives error range: ");
+    reader = redisReaderCreate();
+    redisReaderSetSourceReport(reader,1);
+    redisReaderFeed(reader,"@bad\r\n",6);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_ERR);
+    {
+        redisReplySource s;
+        ret = redisReaderGetReplySource(reader,&s);
+        test_cond(ret == REDIS_OK &&
+                  s.start == 0 && s.end == 1 && s.type == 0);
+    }
+    redisReaderFree(reader);
+
+    test("Source reporting: can be disabled again: ");
+    reader = redisReaderCreate();
+    redisReaderSetSourceReport(reader,1);
+    redisReaderFeed(reader,":1\r\n",4);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL);
+    {
+        redisReplySource s;
+        ret = redisReaderGetReplySource(reader,&s);
+        assert(ret == REDIS_OK && s.start == 0 && s.end == 4);
+    }
+    freeReplyObject(reply);
+    redisReaderSetSourceReport(reader,0);
+    redisReaderFeed(reader,":2\r\n",4);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL);
+    {
+        redisReplySource s;
+        ret = redisReaderGetReplySource(reader,&s);
+        test_cond(ret == REDIS_ERR);
+    }
+    freeReplyObject(reply);
+    redisReaderFree(reader);
+
+    test("Source reporting: reset restarts offset at 0: ");
+    reader = redisReaderCreate();
+    redisReaderSetSourceReport(reader,1);
+    redisReaderFeed(reader,"+OK\r\n",5);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL);
+    {
+        redisReplySource s;
+        ret = redisReaderGetReplySource(reader,&s);
+        assert(ret == REDIS_OK && s.start == 0 && s.end == 5);
+    }
+    freeReplyObject(reply);
+    redisReaderReset(reader);
+    redisReaderFeed(reader,":9\r\n",4);
+    ret = redisReaderGetReply(reader,&reply);
+    assert(ret == REDIS_OK && reply != NULL);
+    {
+        redisReplySource s;
+        ret = redisReaderGetReplySource(reader,&s);
+        test_cond(ret == REDIS_OK &&
+                  s.start == 0 && s.end == 4 && s.type == REDIS_REPLY_INTEGER);
+    }
+    freeReplyObject(reply);
+    redisReaderFree(reader);
 }
 
 static void test_free_null(void) {

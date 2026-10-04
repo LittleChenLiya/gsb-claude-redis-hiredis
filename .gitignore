@@ -1,10 +1,12 @@
 /hiredis-test
 /examples/hiredis-example*
+/source_demo
 /*.o
 /*.so
 /*.dylib
 /*.a
 /*.pc
+*.exe
 *.dSYM
 tags
 compile_commands.json

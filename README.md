@@ -648,6 +648,45 @@ meaning unlimited with:
 context->reader->maxdepth = 0;
 ```
 
+### Reader source reporting
+
+When debugging chunked RESP it is useful to know which byte range of the
+cumulative input each top-level reply consumed. The reader can optionally
+record this, without changing the reply object structure, using:
+```c
+int redisReaderSetSourceReport(redisReader *reader, int on);
+int redisReaderGetReplySource(redisReader *reader, redisReplySource *src);
+void redisReaderReset(redisReader *reader);
+```
+
+Source reporting is disabled by default. Call `redisReaderSetSourceReport(reader, 1)`
+to enable it. After a successful `redisReaderGetReply` call that returned a
+reply, `redisReaderGetReplySource` fills a `redisReplySource` describing the
+range:
+```c
+typedef struct redisReplySource {
+    size_t start; /* Cumulative feed offset of the first reply byte. */
+    size_t end;   /* Cumulative feed offset one past the last reply byte. */
+    int type;     /* Reply type (REDIS_REPLY_*), or 0 for an error range. */
+} redisReplySource;
+```
+
+The offsets are cumulative: they count every byte fed to the reader since it
+was created (or last reset), regardless of how the bytes were split across
+`redisReaderFeed` calls. The range is half-open `[start, end)`. Nested replies
+are not reported separately; only the outermost top-level reply gets one range
+covering the whole aggregate. A RESP3 push reply is itself a top-level reply
+and gets its own range. A partial reply never reports a range early. When a
+protocol error occurs, the range describes the bytes consumed for the failed
+reply and `type` is set to `0`.
+
+`redisReaderReset` restores the reader to a freshly-created state (discarding
+any pending reply, buffered bytes and error) and restarts the cumulative feed
+offset at `0` (a new session). Source reporting configuration is preserved.
+
+A small standalone demo that prints the ranges of replies fed across several
+chunks is available as `source_demo.c` in the repository root.
+
 ## SSL/TLS Support
 
 ### Building

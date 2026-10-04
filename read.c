@@ -74,6 +74,16 @@
 static void __redisReaderSetError(redisReader *r, int type, const char *str) {
     size_t len;
 
+    /* Record the source range of the failed reply before the buffer is
+     * cleared. The range covers the bytes consumed for the reply since it
+     * started; `type` is set to 0 to distinguish it from a completed reply. */
+    if (r->source_report) {
+        r->source.start = r->reply_start;
+        r->source.end = r->buf_abs + r->pos;
+        r->source.type = 0;
+        r->source_valid = 1;
+    }
+
     if (r->reply != NULL && r->fn && r->fn->freeObject) {
         r->fn->freeObject(r->reply);
         r->reply = NULL;
@@ -263,6 +273,14 @@ static void moveToNextTask(redisReader *r) {
     while (r->ridx >= 0) {
         /* Return a.s.a.p. when the stack is now empty. */
         if (r->ridx == 0) {
+            if (r->source_report) {
+                /* A top-level reply just completed. Nested replies are not
+                 * reported separately: the whole aggregate gets one range. */
+                r->source.start = r->reply_start;
+                r->source.end = r->buf_abs + r->pos;
+                r->source.type = r->task[0]->type;
+                r->source_valid = 1;
+            }
             r->ridx--;
             return;
         }
@@ -759,6 +777,10 @@ redisReader *redisReaderCreateWithFunctions(redisReplyObjectFunctions *fn) {
     r->maxelements = REDIS_READER_MAX_ARRAY_ELEMENTS;
     r->maxdepth = REDIS_READER_MAX_REPLY_DEPTH;
     r->ridx = -1;
+    r->source_report = 0;
+    r->source_valid = 0;
+    r->buf_abs = 0;
+    r->reply_start = 0;
 
     return r;
 oom:
@@ -839,6 +861,9 @@ int redisReaderGetReply(redisReader *r, void **reply) {
         r->task[0]->parent = NULL;
         r->task[0]->privdata = r->privdata;
         r->ridx = 0;
+        /* Record the cumulative offset where this top-level reply starts. */
+        if (r->source_report)
+            r->reply_start = r->buf_abs + r->pos;
     }
 
     /* Process items in reply. */
@@ -854,6 +879,8 @@ int redisReaderGetReply(redisReader *r, void **reply) {
      * doing unnecessary calls to memmove() in sds.c. */
     if (r->pos >= 1024) {
         if (sdsrange(r->buf,r->pos,-1) < 0) return REDIS_ERR;
+        /* The retained bytes start at a later cumulative offset. */
+        r->buf_abs += r->pos;
         r->pos = 0;
         r->len = sdslen(r->buf);
     }
@@ -868,4 +895,41 @@ int redisReaderGetReply(redisReader *r, void **reply) {
         r->reply = NULL;
     }
     return REDIS_OK;
+}
+
+int redisReaderSetSourceReport(redisReader *r, int on) {
+    r->source_report = on ? 1 : 0;
+    return REDIS_OK;
+}
+
+int redisReaderGetReplySource(redisReader *r, redisReplySource *src) {
+    if (src == NULL || !r->source_report || !r->source_valid)
+        return REDIS_ERR;
+    *src = r->source;
+    return REDIS_OK;
+}
+
+void redisReaderReset(redisReader *r) {
+    if (r == NULL)
+        return;
+
+    if (r->reply != NULL && r->fn && r->fn->freeObject)
+        r->fn->freeObject(r->reply);
+    r->reply = NULL;
+
+    /* Clear input buffer. */
+    sdsfree(r->buf);
+    r->buf = sdsempty();
+    r->pos = r->len = 0;
+
+    /* Reset task stack and error state. */
+    r->ridx = -1;
+    r->err = 0;
+    r->errstr[0] = '\0';
+
+    /* Restart the cumulative feed offset at 0 (new session). Source
+     * reporting configuration is preserved. */
+    r->buf_abs = 0;
+    r->reply_start = 0;
+    r->source_valid = 0;
 }

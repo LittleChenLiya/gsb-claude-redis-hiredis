@@ -255,6 +255,11 @@ hiredis-example: examples/example.c $(STLIBNAME)
 hiredis-example-push: examples/example-push.c $(STLIBNAME)
 	$(CC) -o examples/$@ $(REAL_CFLAGS) -I. $< $(STLIBNAME) $(REAL_LDFLAGS)
 
+# Standalone demo for the optional reply source reporting (no Redis server
+# required). Prints the cumulative byte range of each top-level reply.
+source_demo: source_demo.c $(STLIBNAME)
+	$(CC) -o $@ $(REAL_CFLAGS) -I. $< $(STLIBNAME) $(REAL_LDFLAGS)
+
 examples: $(EXAMPLES)
 
 TEST_LIBS = $(STLIBNAME) $(SSL_STLIB)
