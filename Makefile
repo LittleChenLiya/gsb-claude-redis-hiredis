@@ -3,8 +3,8 @@
 # Copyright (C) 2010-2011 Pieter Noordhuis <pcnoordhuis at gmail dot com>
 # This file is released under the BSD license, see the COPYING file
 
-OBJ=alloc.o net.o hiredis.o sds.o async.o read.o sockcompat.o
-EXAMPLES=hiredis-example hiredis-example-libevent hiredis-example-libev hiredis-example-glib hiredis-example-push hiredis-example-poll
+OBJ=alloc.o net.o hiredis.o sds.o async.o read.o sockcompat.o cmdview.o
+EXAMPLES=hiredis-example hiredis-example-libevent hiredis-example-libev hiredis-example-glib hiredis-example-push hiredis-example-poll hiredis-example-cmdview
 TESTS=hiredis-test
 LIBNAME=libhiredis
 PKGCONFNAME=hiredis.pc
@@ -171,6 +171,7 @@ net.o: net.c fmacros.h net.h hiredis.h read.h sds.h alloc.h sockcompat.h win32.h
 read.o: read.c fmacros.h alloc.h read.h sds.h win32.h
 sds.o: sds.c sds.h sdsalloc.h alloc.h
 sockcompat.o: sockcompat.c sockcompat.h
+cmdview.o: cmdview.c fmacros.h cmdview.h read.h alloc.h
 test.o: test.c fmacros.h hiredis.h read.h sds.h alloc.h net.h sockcompat.h win32.h
 
 $(DYLIBNAME): $(OBJ)
@@ -215,6 +216,9 @@ hiredis-example-ssl: examples/example-ssl.c $(STLIBNAME) $(SSL_STLIBNAME)
 	$(CC) -o examples/$@ $(REAL_CFLAGS) -I. $< $(STLIBNAME) $(SSL_STLIBNAME) $(REAL_LDFLAGS) $(SSL_LDFLAGS)
 
 hiredis-example-poll: examples/example-poll.c adapters/poll.h $(STLIBNAME)
+	$(CC) -o examples/$@ $(REAL_CFLAGS) -I. $< $(STLIBNAME) $(REAL_LDFLAGS)
+
+hiredis-example-cmdview: examples/example-cmdview.c $(STLIBNAME)
 	$(CC) -o examples/$@ $(REAL_CFLAGS) -I. $< $(STLIBNAME) $(REAL_LDFLAGS)
 
 ifndef AE_DIR
@@ -320,7 +324,7 @@ $(SSL_PKGCONFNAME): hiredis_ssl.h
 
 install: $(DYLIBNAME) $(STLIBNAME) $(PKGCONFNAME) $(SSL_INSTALL)
 	mkdir -p $(INSTALL_INCLUDE_PATH) $(INSTALL_INCLUDE_PATH)/adapters $(INSTALL_LIBRARY_PATH)
-	$(INSTALL) hiredis.h async.h read.h sds.h alloc.h sockcompat.h $(INSTALL_INCLUDE_PATH)
+	$(INSTALL) hiredis.h async.h read.h sds.h alloc.h sockcompat.h cmdview.h $(INSTALL_INCLUDE_PATH)
 	$(INSTALL) adapters/*.h $(INSTALL_INCLUDE_PATH)/adapters
 	$(INSTALL) $(DYLIBNAME) $(INSTALL_LIBRARY_PATH)/$(DYLIB_MINOR_NAME)
 	cd $(INSTALL_LIBRARY_PATH) && ln -sf $(DYLIB_MINOR_NAME) $(DYLIBNAME) && ln -sf $(DYLIB_MINOR_NAME) $(DYLIB_MAJOR_NAME)

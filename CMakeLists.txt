@@ -41,6 +41,7 @@ SET(CMAKE_DEBUG_POSTFIX d)
 SET(hiredis_sources
     alloc.c
     async.c
+    cmdview.c
     hiredis.c
     net.c
     read.c
@@ -126,7 +127,7 @@ if (ENABLE_NUGET)
         DESTINATION build/native)
 endif()
 
-INSTALL(FILES hiredis.h read.h sds.h async.h alloc.h sockcompat.h
+INSTALL(FILES hiredis.h read.h sds.h async.h alloc.h sockcompat.h cmdview.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/hiredis)
 
 INSTALL(DIRECTORY adapters
