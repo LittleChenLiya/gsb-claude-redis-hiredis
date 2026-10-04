@@ -59,3 +59,6 @@ TARGET_LINK_LIBRARIES(example hiredis)
 
 ADD_EXECUTABLE(example-push example-push.c)
 TARGET_LINK_LIBRARIES(example-push hiredis)
+
+ADD_EXECUTABLE(example-commandview example-commandview.c)
+TARGET_LINK_LIBRARIES(example-commandview hiredis)

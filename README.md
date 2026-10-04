@@ -316,6 +316,48 @@ need to be binary safe, the entire array of lengths `argvlen` should be provided
 
 The return value has the same semantic as `redisCommand`.
 
+### Zero-copy command views
+
+When arguments are large, copying them into a single contiguous buffer (as
+`redisFormatCommandArgv` does) may be undesirable.  The command view API
+encodes the RESP framing once and exposes the command as an ordered list of
+byte segments that *borrow* the original argument buffers, so the payloads
+are never copied again:
+
+```c
+redisCommandView *view = redisCommandViewCreateArgv(argc, argv, argvlen);
+```
+
+A view consists of segment 0 (the RESP array header `*<argc>\r\n`) followed,
+per argument, by the bulk header (`$<len>\r\n`), the borrowed argument
+payload, and the trailing `\r\n`.  All framing is owned by the view; the
+payload segments point at the caller's `argv[]` buffers, which must stay
+alive and unmodified until the view is freed.  Argument lengths come from the
+caller-supplied `argvlen[]` byte counts (or `strlen(3)` when `argvlen` is
+`NULL`), so payloads may contain NUL bytes and arbitrary non-UTF-8 data.  All
+size computations are overflow-checked, and creation is all-or-nothing: on
+invalid input, size overflow, or allocation failure,
+`redisCommandViewCreateArgv` returns `NULL` and never produces a partial
+view.
+
+The segments can be walked in wire order and handed to a scatter/gather
+write such as `writev(2)`:
+
+```c
+redisCommandViewSegment seg;
+while (redisCommandViewNext(view, &seg) == 0) {
+    /* seg.ptr / seg.len: next chunk of the encoded command */
+}
+redisCommandViewRewind(view); /* resets the cursor without re-encoding */
+```
+
+`redisCommandViewSegmentCount` and `redisCommandViewTotalLen` report the
+number of segments and the total encoded length (identical to the value
+`redisFormatCommandArgv` would return), and `redisCommandViewGetSegment`
+gives random access by index.  `redisCommandViewFree` releases the view and
+its owned framing only — it never frees the borrowed argument buffers.  See
+`examples/example-commandview.c` for a complete demo.
+
 ### Pipelining
 
 To explain how Hiredis supports pipelining in a blocking connection, there needs to be

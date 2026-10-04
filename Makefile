@@ -4,7 +4,7 @@
 # This file is released under the BSD license, see the COPYING file
 
 OBJ=alloc.o net.o hiredis.o sds.o async.o read.o sockcompat.o
-EXAMPLES=hiredis-example hiredis-example-libevent hiredis-example-libev hiredis-example-glib hiredis-example-push hiredis-example-poll
+EXAMPLES=hiredis-example hiredis-example-libevent hiredis-example-libev hiredis-example-glib hiredis-example-push hiredis-example-poll hiredis-example-commandview
 TESTS=hiredis-test
 LIBNAME=libhiredis
 PKGCONFNAME=hiredis.pc
@@ -253,6 +253,9 @@ hiredis-example: examples/example.c $(STLIBNAME)
 	$(CC) -o examples/$@ $(REAL_CFLAGS) -I. $< $(STLIBNAME) $(REAL_LDFLAGS)
 
 hiredis-example-push: examples/example-push.c $(STLIBNAME)
+	$(CC) -o examples/$@ $(REAL_CFLAGS) -I. $< $(STLIBNAME) $(REAL_LDFLAGS)
+
+hiredis-example-commandview: examples/example-commandview.c $(STLIBNAME)
 	$(CC) -o examples/$@ $(REAL_CFLAGS) -I. $< $(STLIBNAME) $(REAL_LDFLAGS)
 
 examples: $(EXAMPLES)

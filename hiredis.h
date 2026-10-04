@@ -144,6 +144,60 @@ long long redisFormatSdsCommandArgv(sds *target, int argc, const char ** argv, c
 void redisFreeCommand(char *cmd);
 void redisFreeSdsCommand(sds cmd);
 
+/* Zero-copy command view API.
+ *
+ * A redisCommandView encodes a command at the protocol level as an ordered
+ * list of byte segments, without copying the argument payloads (unlike
+ * redisFormatCommandArgv, which always builds one contiguous buffer).  This
+ * is useful when arguments are large and copying them again is undesirable;
+ * the segments can be handed straight to a scatter/gather write such as
+ * writev(2).
+ *
+ * A view is laid out as:
+ *   segment 0        : the RESP array header ("*<argc>\r\n"), owned by the view
+ *   per argument j   : the bulk header ("$<len>\r\n", owned by the view),
+ *                      the argument payload (borrowed, see below), and the
+ *                      trailing "\r\n" (owned by the view)
+ *
+ * Ownership and lifetimes:
+ *   - All RESP framing (the array header, the per-argument bulk headers and
+ *     the CRLF terminators) is allocated and owned by the view itself and
+ *     stays valid until redisCommandViewFree() is called.
+ *   - The argument payload segments point at the caller-provided argv[]
+ *     buffers.  They are BORROWED: the caller must keep every argv[] buffer
+ *     alive and unmodified until the view is freed.  redisCommandViewFree()
+ *     releases only the view and its owned framing; it never frees the
+ *     borrowed argument buffers.
+ *
+ * Argument lengths always come from the caller-supplied argvlen[] byte
+ * counts, so payloads may contain NUL bytes and arbitrary non-UTF-8 data.
+ * If argvlen is NULL, strlen(3) is used per argument, exactly like
+ * redisFormatCommandArgv.  All size computations are overflow-checked and an
+ * over-long argument is rejected before anything is allocated.
+ *
+ * Creation is all-or-nothing: on any failure (invalid input, size overflow
+ * or allocation failure) redisCommandViewCreateArgv() returns NULL and no
+ * partial view is ever produced.
+ *
+ * Iteration (redisCommandViewNext) walks the precomputed segment table, so
+ * redisCommandViewRewind() resets the cursor without re-encoding anything
+ * and repeated iterations always yield identical segments.
+ */
+typedef struct redisCommandViewSegment {
+    const char *ptr; /* start of the segment (borrowed or view-owned) */
+    size_t len;      /* length of the segment in bytes */
+} redisCommandViewSegment;
+
+typedef struct redisCommandView redisCommandView;
+
+redisCommandView *redisCommandViewCreateArgv(int argc, const char **argv, const size_t *argvlen);
+size_t redisCommandViewSegmentCount(const redisCommandView *view);
+size_t redisCommandViewTotalLen(const redisCommandView *view);
+int redisCommandViewGetSegment(const redisCommandView *view, size_t index, redisCommandViewSegment *segment);
+void redisCommandViewRewind(redisCommandView *view);
+int redisCommandViewNext(redisCommandView *view, redisCommandViewSegment *segment);
+void redisCommandViewFree(redisCommandView *view);
+
 enum redisConnectionType {
     REDIS_CONN_TCP,
     REDIS_CONN_UNIX,

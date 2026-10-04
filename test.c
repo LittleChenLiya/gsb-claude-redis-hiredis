@@ -401,6 +401,174 @@ static void test_format_commands(void) {
     sdsfree(sds_cmd);
 }
 
+/* Concatenate every segment of a command view, in wire order, into dst. */
+static size_t command_view_concat(redisCommandView *view, char *dst) {
+    redisCommandViewSegment seg;
+    size_t off = 0, idx = 0;
+
+    while (redisCommandViewNext(view, &seg) == 0) {
+        printf(" [%zu]=%zu", idx++, seg.len);
+        memcpy(dst + off, seg.ptr, seg.len);
+        off += seg.len;
+    }
+    return off;
+}
+
+static size_t counting_malloc_calls;
+static void *hi_malloc_counting(size_t size) {
+    counting_malloc_calls++;
+    return malloc(size);
+}
+
+static size_t failing_malloc_calls;
+static void *hi_malloc_failing_counted(size_t size) {
+    (void)size;
+    failing_malloc_calls++;
+    return NULL;
+}
+
+static void test_command_view(void) {
+    /* Arguments with an embedded NUL, an empty byte string, and non-UTF-8
+     * bytes; lengths always come from the caller-supplied argvlen. */
+    const char *vargv[4];
+    size_t vlens[4];
+    vargv[0] = "SET";            vlens[0] = 3;
+    vargv[1] = "a\0b";           vlens[1] = 3;
+    vargv[2] = "";               vlens[2] = 0;
+    vargv[3] = "\xff\xfe\x00z";  vlens[3] = 4;
+
+    char *cmd = NULL;
+    long long cmdlen = redisFormatCommandArgv(&cmd,4,vargv,vlens);
+    assert(cmd != NULL && cmdlen > 0);
+
+    redisCommandView *view = redisCommandViewCreateArgv(4,vargv,vlens);
+    assert(view != NULL);
+
+    test("Command view reports the full encoded length and segment count: ");
+    test_cond(redisCommandViewTotalLen(view) == (size_t)cmdlen &&
+        redisCommandViewSegmentCount(view) == 1+3*4);
+
+    char *buf = malloc(cmdlen);
+    char *buf2 = malloc(cmdlen);
+    assert(buf != NULL && buf2 != NULL);
+
+    test("Command view segments reassemble to the redisFormatCommandArgv encoding: ");
+    printf("\n    segment order/lengths (bytes):");
+    size_t off = command_view_concat(view,buf);
+    printf(" total=%zu\n    ", off);
+    test_cond(off == (size_t)cmdlen && memcmp(buf,cmd,cmdlen) == 0);
+
+    test("Command view iteration is exhausted at the segment count: ");
+    redisCommandViewSegment seg;
+    test_cond(redisCommandViewNext(view,&seg) == -1);
+
+    test("Command view rewind + repeated iteration yields identical bytes: ");
+    redisCommandViewRewind(view);
+    size_t off2 = command_view_concat(view,buf2);
+    test_cond(off2 == off && memcmp(buf2,buf,off) == 0 &&
+        memcmp(buf2,cmd,cmdlen) == 0);
+
+    test("Command view random access matches iteration order: ");
+    size_t ai, aoff = 0;
+    int aok = redisCommandViewSegmentCount(view) == 1+3*4;
+    for (ai = 0; ai < redisCommandViewSegmentCount(view); ai++) {
+        redisCommandViewSegment aseg;
+        if (redisCommandViewGetSegment(view,ai,&aseg) != 0 ||
+            memcmp(aseg.ptr,cmd+aoff,aseg.len) != 0) {
+            aok = 0;
+            break;
+        }
+        aoff += aseg.len;
+    }
+    test_cond(aok && aoff == (size_t)cmdlen &&
+        redisCommandViewGetSegment(view,ai,&seg) == -1);
+
+    redisCommandViewFree(view);
+
+    test("Command view without lengths matches the strlen-based encoding: ");
+    const char *sargv[2] = { "GET", "foo" };
+    char *scmd = NULL;
+    long long scmdlen = redisFormatCommandArgv(&scmd,2,sargv,NULL);
+    redisCommandView *sview = redisCommandViewCreateArgv(2,sargv,NULL);
+    size_t soff = 0;
+    while (redisCommandViewNext(sview,&seg) == 0) {
+        memcpy(buf+soff,seg.ptr,seg.len);
+        soff += seg.len;
+    }
+    test_cond(sview != NULL && scmd != NULL &&
+        soff == (size_t)scmdlen && memcmp(buf,scmd,scmdlen) == 0);
+    redisCommandViewFree(sview);
+    hi_free(scmd);
+
+    test("Command view handles an empty argument set (argc == 0): ");
+    char *ecmd = NULL;
+    long long ecmdlen = redisFormatCommandArgv(&ecmd,0,NULL,NULL);
+    redisCommandView *eview = redisCommandViewCreateArgv(0,NULL,NULL);
+    size_t eoff = 0;
+    while (eview && redisCommandViewNext(eview,&seg) == 0) {
+        memcpy(buf+eoff,seg.ptr,seg.len);
+        eoff += seg.len;
+    }
+    test_cond(eview != NULL && ecmd != NULL &&
+        redisCommandViewSegmentCount(eview) == 1 &&
+        eoff == (size_t)ecmdlen && eoff == 4 &&
+        memcmp(buf,"*0\r\n",4) == 0 && memcmp(buf,ecmd,ecmdlen) == 0);
+    redisCommandViewFree(eview);
+    hi_free(ecmd);
+
+    test("Command view rejects an oversized length before any allocation: ");
+    const char *bigargv[1] = { "x" };
+    size_t biglens[1] = { SIZE_MAX };
+    hiredisAllocFuncs ha_count = {
+        .mallocFn = hi_malloc_counting,
+        .callocFn = calloc,
+        .reallocFn = realloc,
+        .strdupFn = strdup,
+        .freeFn = free,
+    };
+    counting_malloc_calls = 0;
+    hiredisSetAllocators(&ha_count);
+    redisCommandView *bigview = redisCommandViewCreateArgv(1,bigargv,biglens);
+    test_cond(bigview == NULL && counting_malloc_calls == 0);
+    hiredisResetAllocators();
+
+    test("Command view fails cleanly (and counts) on allocation failure: ");
+    hiredisAllocFuncs ha_fail = {
+        .mallocFn = hi_malloc_failing_counted,
+        .callocFn = calloc,
+        .reallocFn = realloc,
+        .strdupFn = strdup,
+        .freeFn = free,
+    };
+    failing_malloc_calls = 0;
+    hiredisSetAllocators(&ha_fail);
+    redisCommandView *fview = redisCommandViewCreateArgv(4,vargv,vlens);
+    test_cond(fview == NULL && failing_malloc_calls == 1);
+    hiredisResetAllocators();
+
+    test("Command view rejects invalid input without a partial view: ");
+    test_cond(redisCommandViewCreateArgv(-1,vargv,vlens) == NULL &&
+        redisCommandViewCreateArgv(1,NULL,vlens) == NULL);
+
+    test("Command view frees only the view, never the borrowed arguments: ");
+    char *owned = hi_malloc(4);
+    memcpy(owned,"pong",4);
+    const char *oargv[2] = { "ECHO", owned };
+    size_t olens[2] = { 4, 4 };
+    redisCommandView *oview = redisCommandViewCreateArgv(2,oargv,olens);
+    test_cond(oview != NULL);
+    redisCommandViewFree(oview);
+    redisCommandViewFree(NULL); /* freeing NULL must be safe */
+    /* The borrowed buffer must be untouched and still owned by us. */
+    test("Borrowed argument buffer survives redisCommandViewFree: ");
+    test_cond(memcmp(owned,"pong",4) == 0);
+    hi_free(owned);
+
+    free(buf);
+    free(buf2);
+    hi_free(cmd);
+}
+
 static void test_append_formatted_commands(struct config config) {
     redisContext *c;
     redisReply *reply;
@@ -2744,6 +2912,7 @@ int main(int argc, char **argv) {
     test_allocator_injection();
 
     test_format_commands();
+    test_command_view();
     test_reply_reader();
     test_blocking_connection_errors();
     test_free_null();

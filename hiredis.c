@@ -688,6 +688,142 @@ void redisFreeCommand(char *cmd) {
     hi_free(cmd);
 }
 
+/* A zero-copy command view: the RESP framing is owned by the view while the
+ * argument payload segments borrow the caller's argv[] buffers.  Everything
+ * lives in a single allocation laid out as:
+ *
+ *   [ struct redisCommandView | segments[nsegments] | header bytes ]
+ *
+ * so creation is all-or-nothing and failure can never yield half a view. */
+struct redisCommandView {
+    size_t nsegments; /* number of segments in the segment table */
+    size_t total;     /* total encoded command length in bytes */
+    size_t cursor;    /* iteration cursor for redisCommandViewNext */
+};
+
+static redisCommandViewSegment *redisCommandViewSegmentTable(redisCommandView *view) {
+    return (redisCommandViewSegment *)(view + 1);
+}
+
+/* Create a command view for argc/argv/argvlen.  Returns NULL on invalid
+ * input, size overflow, or allocation failure.  Argument lengths are taken
+ * from argvlen (or strlen when argvlen is NULL), so payloads are binary
+ * safe.  All sizes are overflow-checked before anything is allocated. */
+redisCommandView *redisCommandViewCreateArgv(int argc, const char **argv, const size_t *argvlen) {
+    redisCommandView *view;
+    redisCommandViewSegment *segs;
+    size_t nseg, hdrlen, total, alloclen, pos, len, ahdr, idx;
+    char *hdr;
+    int j;
+
+    if (argc < 0 || (argc > 0 && argv == NULL))
+        return NULL;
+
+    /* One array header segment plus three segments (bulk header, payload,
+     * CRLF) per argument.  Overflow-checked. */
+    if ((size_t)argc > (SIZE_MAX - 1) / 3)
+        return NULL;
+    nseg = 1 + 3 * (size_t)argc;
+
+    /* Compute the view-owned header bytes and the total encoded length,
+     * rejecting any size that would overflow before allocating anything. */
+    hdrlen = 1 + countDigits((uint64_t)argc) + 2; /* "*<argc>\r\n" */
+    total = hdrlen;
+    for (j = 0; j < argc; j++) {
+        len = argvlen ? argvlen[j] : strlen(argv[j]);
+        if (len > 0 && argv[j] == NULL)
+            return NULL;
+        /* "$<len>\r\n" + payload + "\r\n"; countDigits() is at most 20 for
+         * a 64-bit size_t, so 32 generously covers the framing overhead. */
+        if (len > SIZE_MAX - 32)
+            return NULL;
+        ahdr = 1 + countDigits(len) + 2 + 2;
+        if (hdrlen > SIZE_MAX - ahdr)
+            return NULL;
+        hdrlen += ahdr;
+        if (total > SIZE_MAX - ahdr - len)
+            return NULL;
+        total += ahdr + len;
+    }
+
+    /* Single allocation: struct + segment table + header bytes. */
+    if (nseg > (SIZE_MAX - sizeof(*view)) / sizeof(redisCommandViewSegment))
+        return NULL;
+    alloclen = sizeof(*view) + nseg * sizeof(redisCommandViewSegment);
+    if (hdrlen > SIZE_MAX - alloclen)
+        return NULL;
+    alloclen += hdrlen;
+
+    view = hi_malloc(alloclen);
+    if (view == NULL)
+        return NULL;
+
+    view->nsegments = nseg;
+    view->total = total;
+    view->cursor = 0;
+
+    segs = redisCommandViewSegmentTable(view);
+    hdr = (char *)(segs + nseg);
+
+    /* Encode the framing once; iteration never re-encodes. */
+    pos = 0;
+    segs[0].ptr = hdr;
+    segs[0].len = (size_t)sprintf(hdr, "*%d\r\n", argc);
+    pos += segs[0].len;
+    for (j = 0; j < argc; j++) {
+        len = argvlen ? argvlen[j] : strlen(argv[j]);
+        idx = 1 + 3 * (size_t)j;
+        segs[idx].ptr = hdr + pos;
+        segs[idx].len = (size_t)sprintf(hdr + pos, "$%zu\r\n", len);
+        pos += segs[idx].len;
+        segs[idx + 1].ptr = argv[j]; /* borrowed payload */
+        segs[idx + 1].len = len;
+        segs[idx + 2].ptr = hdr + pos;
+        segs[idx + 2].len = 2;
+        hdr[pos++] = '\r';
+        hdr[pos++] = '\n';
+    }
+    assert(pos == hdrlen);
+
+    return view;
+}
+
+size_t redisCommandViewSegmentCount(const redisCommandView *view) {
+    return view ? view->nsegments : 0;
+}
+
+size_t redisCommandViewTotalLen(const redisCommandView *view) {
+    return view ? view->total : 0;
+}
+
+int redisCommandViewGetSegment(const redisCommandView *view, size_t index, redisCommandViewSegment *segment) {
+    if (view == NULL || segment == NULL || index >= view->nsegments)
+        return -1;
+    *segment = ((const redisCommandViewSegment *)(view + 1))[index];
+    return 0;
+}
+
+/* Reset the iteration cursor.  The segment table is precomputed, so this
+ * never re-encodes the command. */
+void redisCommandViewRewind(redisCommandView *view) {
+    if (view)
+        view->cursor = 0;
+}
+
+/* Return the next segment in wire order, or -1 when the view is exhausted. */
+int redisCommandViewNext(redisCommandView *view, redisCommandViewSegment *segment) {
+    if (view == NULL || segment == NULL || view->cursor >= view->nsegments)
+        return -1;
+    *segment = redisCommandViewSegmentTable(view)[view->cursor++];
+    return 0;
+}
+
+/* Free the view and its owned RESP framing.  The borrowed argv[] payload
+ * buffers belong to the caller and are never freed here. */
+void redisCommandViewFree(redisCommandView *view) {
+    hi_free(view);
+}
+
 void __redisSetError(redisContext *c, int type, const char *str) {
     size_t len;
 
