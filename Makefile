@@ -5,7 +5,7 @@
 
 OBJ=alloc.o net.o hiredis.o sds.o async.o read.o sockcompat.o
 EXAMPLES=hiredis-example hiredis-example-libevent hiredis-example-libev hiredis-example-glib hiredis-example-push hiredis-example-poll
-TESTS=hiredis-test
+TESTS=hiredis-test reply-spans
 LIBNAME=libhiredis
 PKGCONFNAME=hiredis.pc
 
@@ -172,6 +172,7 @@ read.o: read.c fmacros.h alloc.h read.h sds.h win32.h
 sds.o: sds.c sds.h sdsalloc.h alloc.h
 sockcompat.o: sockcompat.c sockcompat.h
 test.o: test.c fmacros.h hiredis.h read.h sds.h alloc.h net.h sockcompat.h win32.h
+reply_spans.o: reply_spans.c fmacros.h read.h sds.h alloc.h win32.h
 
 $(DYLIBNAME): $(OBJ)
 	$(DYLIB_MAKE_CMD) -o $(DYLIBNAME) $(OBJ) $(REAL_LDFLAGS)
@@ -269,11 +270,19 @@ endif
 hiredis-test: test.o $(TEST_LIBS)
 	$(CC) -o $@ $(REAL_CFLAGS) -I. $^ $(REAL_LDFLAGS) $(TEST_LDFLAGS)
 
+# The span demo only exercises the reader, so it links just the reader
+# objects rather than the whole library.
+reply-spans: reply_spans.o read.o sds.o alloc.o
+	$(CC) -o $@ $(REAL_CFLAGS) -I. $^ $(REAL_LDFLAGS)
+
 hiredis-%: %.o $(STLIBNAME)
 	$(CC) $(REAL_CFLAGS) -o $@ $< $(TEST_LIBS) $(REAL_LDFLAGS)
 
 test: hiredis-test
 	./hiredis-test
+
+span-test: reply-spans
+	./reply-spans
 
 check: hiredis-test
 	TEST_SSL=$(USE_SSL) ./test.sh
@@ -363,4 +372,4 @@ coverage: gcov
 noopt:
 	$(MAKE) OPTIMIZATION=""
 
-.PHONY: all test check clean dep install 32bit 32bit-vars gprof gcov noopt
+.PHONY: all test span-test check clean dep install 32bit 32bit-vars gprof gcov noopt

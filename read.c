@@ -71,8 +71,39 @@
 /* Initial size of our nested reply stack and how much we grow it when needd */
 #define REDIS_READER_STACK_SIZE 9
 
+/* Append one span to the reader's span list. Only offsets and the type are
+ * stored; payload bytes are never copied. */
+static int __redisReaderRecordSpan(redisReader *r, unsigned long long start,
+                                   unsigned long long end, int type) {
+    redisReplySpan *aux;
+
+    if (r->spans_len == r->spans_cap) {
+        size_t newcap = r->spans_cap ? r->spans_cap * 2 : 8;
+        aux = hi_realloc(r->spans, newcap * sizeof(*r->spans));
+        if (aux == NULL)
+            return REDIS_ERR;
+        r->spans = aux;
+        r->spans_cap = newcap;
+    }
+
+    r->spans[r->spans_len].start = start;
+    r->spans[r->spans_len].end = end;
+    r->spans[r->spans_len].type = type;
+    r->spans_len++;
+    return REDIS_OK;
+}
+
 static void __redisReaderSetError(redisReader *r, int type, const char *str) {
     size_t len;
+
+    /* When span tracking is on and a top-level reply was in progress,
+     * report the byte range consumed by the incomplete reply as an error
+     * span before the buffer (and its positions) are cleared below. */
+    if (r->spans_enabled && r->ridx >= 0) {
+        __redisReaderRecordSpan(r, r->span_start, r->offset + r->pos,
+                                REDIS_REPLY_SPAN_ERROR);
+        /* A recording failure here is secondary to the error being set. */
+    }
 
     if (r->reply != NULL && r->fn && r->fn->freeObject) {
         r->fn->freeObject(r->reply);
@@ -783,6 +814,7 @@ void redisReaderFree(redisReader *r) {
     }
 
     sdsfree(r->buf);
+    hi_free(r->spans);
     hi_free(r);
 }
 
@@ -839,6 +871,9 @@ int redisReaderGetReply(redisReader *r, void **reply) {
         r->task[0]->parent = NULL;
         r->task[0]->privdata = r->privdata;
         r->ridx = 0;
+
+        /* A new top-level reply starts at the current absolute offset. */
+        r->span_start = r->offset + r->pos;
     }
 
     /* Process items in reply. */
@@ -850,10 +885,24 @@ int redisReaderGetReply(redisReader *r, void **reply) {
     if (r->err)
         return REDIS_ERR;
 
+    /* Record the source span of a completed top-level reply. Nested
+     * replies are not reported separately: their bytes are part of this
+     * single enclosing range. A partially fed reply (ridx >= 0) is never
+     * reported. This must happen before the buffer discard below, while
+     * r->pos still reflects the absolute end of the reply. */
+    if (r->spans_enabled && r->ridx == -1) {
+        if (__redisReaderRecordSpan(r, r->span_start, r->offset + r->pos,
+                                    r->task[0]->type) != REDIS_OK) {
+            __redisReaderSetErrorOOM(r);
+            return REDIS_ERR;
+        }
+    }
+
     /* Discard part of the buffer when we've consumed at least 1k, to avoid
      * doing unnecessary calls to memmove() in sds.c. */
     if (r->pos >= 1024) {
         if (sdsrange(r->buf,r->pos,-1) < 0) return REDIS_ERR;
+        r->offset += r->pos;
         r->pos = 0;
         r->len = sdslen(r->buf);
     }
@@ -868,4 +917,64 @@ int redisReaderGetReply(redisReader *r, void **reply) {
         r->reply = NULL;
     }
     return REDIS_OK;
+}
+
+int redisReaderReset(redisReader *r) {
+    if (r == NULL)
+        return REDIS_ERR;
+
+    if (r->reply != NULL && r->fn && r->fn->freeObject)
+        r->fn->freeObject(r->reply);
+    r->reply = NULL;
+
+    /* Clear the input buffer, allocating a fresh one when it was destroyed
+     * by an error. */
+    if (r->buf != NULL) {
+        sdsclear(r->buf);
+    } else {
+        r->buf = sdsempty();
+        if (r->buf == NULL) {
+            r->err = REDIS_ERR_OOM;
+            snprintf(r->errstr,sizeof(r->errstr),"Out of memory");
+            return REDIS_ERR;
+        }
+    }
+    r->pos = r->len = 0;
+
+    /* Clear the error state and the task stack. */
+    r->err = 0;
+    r->errstr[0] = '\0';
+    r->ridx = -1;
+
+    /* A reset starts a new session: absolute feed offsets restart at 0 and
+     * previously recorded spans (which refer to the old session's offsets)
+     * are dropped. The span tracking enabled flag is kept. */
+    r->offset = 0;
+    r->span_start = 0;
+    r->spans_len = 0;
+
+    return REDIS_OK;
+}
+
+void redisReaderEnableSpans(redisReader *r, int enabled) {
+    if (r == NULL)
+        return;
+
+    r->spans_enabled = (enabled != 0);
+    if (r->spans_enabled) {
+        /* Anchor the next top-level reply at the current absolute consume
+         * position, so enabling mid-stream still yields correct ranges. */
+        r->span_start = r->offset + r->pos;
+    }
+}
+
+const redisReplySpan *redisReaderSpans(const redisReader *r, size_t *count) {
+    if (count != NULL)
+        *count = (r != NULL) ? r->spans_len : 0;
+    return (r != NULL) ? r->spans : NULL;
+}
+
+void redisReaderClearSpans(redisReader *r) {
+    if (r != NULL)
+        r->spans_len = 0;
 }

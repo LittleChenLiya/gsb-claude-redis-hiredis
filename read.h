@@ -72,9 +72,34 @@
 /* Default maximum depth of nested aggregate replies. */
 #define REDIS_READER_MAX_REPLY_DEPTH 1024
 
+/* Span type used for source ranges that were terminated by an error
+ * (e.g. a protocol error) instead of a complete reply. */
+#define REDIS_REPLY_SPAN_ERROR -1
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Source span of a single top-level reply, expressed as absolute byte
+ * offsets into the stream of bytes fed to the reader since its creation
+ * (or since the last redisReaderReset(), which starts a new session whose
+ * offsets restart at 0).
+ *
+ * [start, end) is a half-open range: start is the offset of the first
+ * byte of the reply and end is the offset one past its last byte, so
+ * consecutive replies produce consecutive ranges. 'type' is one of the
+ * REDIS_REPLY_* protocol types of the top-level reply (a push reply is
+ * reported as its own top-level REDIS_REPLY_PUSH range), or
+ * REDIS_REPLY_SPAN_ERROR when the range was cut short by an error.
+ *
+ * Nested replies are never reported separately: their bytes are part of
+ * the single range of the enclosing top-level reply. Only offsets and the
+ * type are recorded; payload bytes are never copied into a span. */
+typedef struct redisReplySpan {
+    unsigned long long start; /* absolute offset of the first reply byte */
+    unsigned long long end;   /* absolute offset one past the last byte */
+    int type;                 /* REDIS_REPLY_* or REDIS_REPLY_SPAN_ERROR */
+} redisReplySpan;
 
 typedef struct redisReadTask {
     int type;
@@ -115,6 +140,16 @@ typedef struct redisReader {
     void *privdata;
 
     int maxdepth; /* Max nested aggregate reply depth */
+
+    /* Optional reply source span tracking (disabled by default, see
+     * redisReaderEnableSpans()). */
+    int spans_enabled;             /* nonzero when span tracking is on */
+    unsigned long long offset;     /* absolute feed offset of buf[0] */
+    unsigned long long span_start; /* absolute offset where the current
+                                    * top-level reply started */
+    redisReplySpan *spans;         /* recorded spans, grows dynamically */
+    size_t spans_len;              /* number of recorded spans */
+    size_t spans_cap;              /* allocated capacity of spans */
 } redisReader;
 
 /* Public API for the protocol parser. */
@@ -122,6 +157,31 @@ redisReader *redisReaderCreateWithFunctions(redisReplyObjectFunctions *fn);
 void redisReaderFree(redisReader *r);
 int redisReaderFeed(redisReader *r, const char *buf, size_t len);
 int redisReaderGetReply(redisReader *r, void **reply);
+
+/* Reset a reader to a fresh state: any error is cleared, the input buffer
+ * and the reply task stack are emptied, and all recorded spans are dropped.
+ * A reset starts a new session: absolute feed offsets (and therefore the
+ * offsets reported in spans) restart at 0. The span tracking enabled flag
+ * itself is kept. Returns REDIS_OK on success, REDIS_ERR on failure. */
+int redisReaderReset(redisReader *r);
+
+/* Enable or disable source span tracking for top-level replies. Tracking
+ * is disabled by default and has no effect on the reply objects produced
+ * by redisReaderGetReply(). When enabled, every completed top-level reply
+ * appends one redisReplySpan, and an error appends one REDIS_REPLY_SPAN_ERROR
+ * span for the incomplete reply. A reply is only reported once it is
+ * complete: partially fed input never produces a span. Spans recorded
+ * before disabling are kept; use redisReaderClearSpans() to drop them. */
+void redisReaderEnableSpans(redisReader *r, int enabled);
+
+/* Return the recorded spans and, when 'count' is not NULL, store the
+ * number of spans in it. The returned pointer is owned by the reader and
+ * is invalidated by recording new spans, clearing, resetting or freeing
+ * the reader. Returns NULL when no spans were recorded. */
+const redisReplySpan *redisReaderSpans(const redisReader *r, size_t *count);
+
+/* Drop all recorded spans without disabling tracking. */
+void redisReaderClearSpans(redisReader *r);
 
 #define redisReaderSetPrivdata(_r, _p) (int)(((redisReader*)(_r))->privdata = (_p))
 #define redisReaderGetObject(_r) (((redisReader*)(_r))->reply)

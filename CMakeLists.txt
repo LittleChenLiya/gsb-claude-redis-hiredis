@@ -247,6 +247,9 @@ IF(NOT DISABLE_TESTS)
     ENDIF()
     ADD_TEST(NAME hiredis-test
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test.sh)
+    ADD_EXECUTABLE(reply-spans reply_spans.c)
+    TARGET_LINK_LIBRARIES(reply-spans hiredis)
+    ADD_TEST(NAME reply-spans COMMAND reply-spans)
 ENDIF()
 
 # Add examples

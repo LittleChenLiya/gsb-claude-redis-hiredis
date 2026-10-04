@@ -648,6 +648,56 @@ meaning unlimited with:
 context->reader->maxdepth = 0;
 ```
 
+### Reader reply source spans
+
+When debugging chunked RESP streams it is often useful to know exactly which
+bytes of the input produced each top-level reply. The reader can optionally
+report this through source spans, without changing the reply objects it
+produces:
+
+```c
+void redisReaderEnableSpans(redisReader *reader, int enabled);
+const redisReplySpan *redisReaderSpans(const redisReader *reader, size_t *count);
+void redisReaderClearSpans(redisReader *reader);
+int redisReaderReset(redisReader *reader);
+```
+
+Span tracking is disabled by default. Once enabled with
+`redisReaderEnableSpans`, every completed top-level reply appends one
+`redisReplySpan` to the reader's span list:
+
+```c
+typedef struct redisReplySpan {
+    unsigned long long start; /* absolute offset of the first reply byte */
+    unsigned long long end;   /* absolute offset one past the last byte */
+    int type;                 /* REDIS_REPLY_* or REDIS_REPLY_SPAN_ERROR */
+} redisReplySpan;
+```
+
+The offsets are absolute positions in the stream of bytes fed to the reader
+since its creation (or since the last `redisReaderReset`, which starts a new
+session whose offsets restart at 0 and drops previously recorded spans).
+`[start, end)` is a half-open range, so consecutive replies produce
+consecutive ranges. Only offsets and the type are recorded; payload bytes are
+never copied into a span.
+
+The semantics are:
+
+* A span is reported only when its top-level reply is complete; partially fed
+  input never produces a span.
+* Nested replies are not reported separately: their bytes are part of the
+  single range of the enclosing top-level reply.
+* A push reply is reported as its own top-level `REDIS_REPLY_PUSH` range.
+* A CRLF inside binary bulk content is payload, not a boundary; the range
+  covers the whole bulk item.
+* When a protocol error occurs, the byte range consumed by the incomplete
+  reply is reported as one span with type `REDIS_REPLY_SPAN_ERROR`.
+
+Recorded spans can be inspected with `redisReaderSpans` and dropped with
+`redisReaderClearSpans`. See `reply_spans.c` (`make reply-spans &&
+./reply-spans`) for a small program that prints the ranges of replies fed in
+chunks.
+
 ## SSL/TLS Support
 
 ### Building

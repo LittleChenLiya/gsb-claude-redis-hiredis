@@ -8,3 +8,5 @@
 *.dSYM
 tags
 compile_commands.json
+/reply-spans
+/reply-spans.exe
